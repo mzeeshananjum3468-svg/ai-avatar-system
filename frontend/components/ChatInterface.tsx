@@ -157,7 +157,7 @@ function IdleAvatar({ imageUrl }: { imageUrl: string | null }) {
       <img
         src={imageUrl}
         alt="Avatar idle"
-        className="avatar-idle relative z-10 w-full h-full object-cover"
+        className="avatar-idle relative z-10 w-full h-full object-contain"
         style={{ borderRadius: '0.75rem' }}
       />
       {/* Subtle scanline shimmer overlay */}
@@ -1103,17 +1103,20 @@ export function ChatInterface({ avatarId, voiceId, resumeSessionId, onSessionCre
   const showPlaceholder = !idleVideoUrl && !thinkingVideoUrl
 
   return (
-    <div className="grid grid-cols-1 lg:grid-cols-5 gap-6 h-[calc(100vh-10rem)]">
+    <div className="grid grid-cols-1 lg:grid-cols-6 gap-6 h-[calc(100vh-7rem)]">
       {/* ── Video Panel ─────────────────────────────────────────────────── */}
-      <div className="lg:col-span-3 flex flex-col gap-4">
-        <div className="card-glow flex-1 relative overflow-hidden rounded-2xl group">
+      <div className="lg:col-span-4 flex flex-col gap-4 min-h-0">
+        <div className="card-glow flex-1 min-h-0 flex flex-col relative overflow-hidden rounded-2xl group">
           {/* Neon border when speaking */}
           {isSpeaking && (
             <div className="absolute inset-0 rounded-2xl neon-border pointer-events-none z-10 animate-glow" />
           )}
 
-          {/* Main display area */}
-          <div className="aspect-video w-full bg-surface-950 rounded-xl overflow-hidden relative">
+          {/* Main display area — fills all remaining vertical space in the
+              panel (rather than being capped to a 16:9 box) so a full-body
+              portrait avatar video has room to render at full height instead
+              of being cropped. */}
+          <div className="flex-1 min-h-[32rem] lg:min-h-[40rem] w-full bg-surface-950 rounded-xl overflow-hidden relative">
 
             {/* ── Placeholder (only when this avatar has no idle/thinking loop yet) ── */}
             <div
@@ -1128,16 +1131,19 @@ export function ChatInterface({ avatarId, voiceId, resumeSessionId, onSessionCre
             {/* `muted` is intentionally NOT a controlled prop here — it's driven
                 imperatively by the playback engine (loops always muted, chunks
                 follow isMuted) via refs. Binding it through JSX would make React
-                force it back on every re-render and permanently silence chunks. */}
+                force it back on every re-render and permanently silence chunks.
+                `object-contain` (not `cover`) mirrors test_client.html's stage —
+                the full frame is always visible, letterboxed instead of cropped,
+                so a full-body avatar never loses its head/feet. */}
             <video
               ref={videoARef}
-              className="absolute inset-0 w-full h-full object-cover transition-opacity duration-100"
+              className="absolute inset-0 w-full h-full object-contain transition-opacity duration-100"
               style={{ opacity: !showPlaceholder && activeIdx === 0 ? 1 : 0, zIndex: activeIdx === 0 ? 5 : 4 }}
               playsInline
             />
             <video
               ref={videoBRef}
-              className="absolute inset-0 w-full h-full object-cover transition-opacity duration-100"
+              className="absolute inset-0 w-full h-full object-contain transition-opacity duration-100"
               style={{ opacity: !showPlaceholder && activeIdx === 1 ? 1 : 0, zIndex: activeIdx === 1 ? 5 : 4 }}
               playsInline
             />
@@ -1252,7 +1258,7 @@ export function ChatInterface({ avatarId, voiceId, resumeSessionId, onSessionCre
       </div>
 
       {/* ── Chat Panel ──────────────────────────────────────────────────── */}
-      <div className="lg:col-span-2 flex flex-col glass-card rounded-2xl overflow-hidden p-0">
+      <div className="lg:col-span-2 flex flex-col min-h-0 glass-card rounded-2xl overflow-hidden p-0">
         <div className="flex items-center justify-between px-5 py-4 border-b border-white/8">
           <div className="flex items-center gap-2">
             <MessageCircle size={16} className="text-primary-400" />

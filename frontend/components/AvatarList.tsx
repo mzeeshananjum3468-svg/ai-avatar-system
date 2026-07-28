@@ -140,13 +140,13 @@ export function AvatarList({ selectedAvatar, onSelectAvatar }: AvatarListProps) 
                   style={{ animationDelay: `${idx * 0.05}s` }}
                 >
                   {/* Image */}
-                  <div className="aspect-square relative bg-surface-700 overflow-hidden">
+                  <div className="aspect-[3/4] relative bg-surface-700 overflow-hidden">
                     {(avatar.thumbnail_url || avatar.image_url) ? (
                       <Image
                         src={(avatar.thumbnail_url || avatar.image_url) as string}
                         alt={avatar.name}
                         fill
-                        className="object-cover transition-transform duration-500 group-hover:scale-110"
+                        className="object-contain transition-transform duration-500 group-hover:scale-105"
                       />
                     ) : (
                       <div className="w-full h-full flex items-center justify-center">
