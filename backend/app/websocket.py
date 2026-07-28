@@ -66,8 +66,16 @@ def _write_private_bytes(path: Path, data: bytes) -> None:
 # colon/dash) once it's long enough, so audio+video start as early as
 # possible. Every chunk after that uses SENTENCE boundaries — fewer TTS
 # calls and smoother prosody for the bulk of the reply.
-_MIN_SENTENCE_LEN = 8
-_MIN_FIRST_CHUNK_LEN = 10  # ship the opening clause fast (~2 words)
+_MIN_SENTENCE_LEN = 35
+# Chatterbox's alignment-based EOS forcing (AlignmentStreamAnalyzer) only
+# trusts its own "keep going" heuristic once the text is > 5 tokens long;
+# below that it's prone to losing track of position and over-generating
+# past the real end of speech (spoken text followed by trailing gibberish).
+# 10 chars (~2 words) sat right in that unreliable range, so first-chunk
+# audio was the most common place this showed up. 35 chars still ships
+# well before a full sentence (latency win intact) but reliably clears
+# the token-count floor.
+_MIN_FIRST_CHUNK_LEN = 40  # ship the opening clause fast, but not too short for TTS
 # Force-flush a run-on with no usable punctuation so we never stall waiting
 # for a boundary that may never come.
 _MAX_CHUNK_CHARS = 200
@@ -272,22 +280,46 @@ class ConnectionManager:
         return None
 
     async def _resolve_local_image(self, avatar) -> str:
-        """Return a local FS path to the avatar image, downloading from S3 if needed."""
-        cache_path = TMPDIR / "avatars" / f"{avatar.id}.jpg"
+        """Return a local FS path to the avatar source, downloading from storage if needed.
+
+        Prefers an actual video source so MuseTalk drives real head motion
+        instead of just lip-syncing a flat photo: the raw uploaded video when
+        the avatar was created from one, otherwise the LivePortrait-generated
+        idle loop once it's ready. Falls back to the static processed image
+        only when neither video exists yet.
+        """
+        metadata = avatar.avatar_metadata or {}
+        if isinstance(metadata, str):
+            try:
+                metadata = json.loads(metadata)
+            except Exception:
+                metadata = {}
+
+        source_type = str(metadata.get("source_type") or "").lower()
+        source_key = metadata.get("source_key")
+
+        if source_type == "video" and source_key:
+            preferred_key, suffix = source_key, ".mp4"
+        elif avatar.idle_video_url:
+            preferred_key, suffix = f"avatars/{avatar.id}/idle.mp4", ".idle.mp4"
+        else:
+            preferred_key, suffix = avatar.s3_key, ".jpg"
+
+        cache_path = TMPDIR / "avatars" / f"{avatar.id}{suffix}"
         if cache_path.exists():
             return str(cache_path)
 
         # Local storage: use get_local_path directly
         try:
-            local = storage_service.get_local_path(avatar.s3_key)
+            local = storage_service.get_local_path(preferred_key)
             if Path(local).exists():
                 return local
         except (NotImplementedError, AttributeError):
             pass
 
-        # S3 fallback: download and cache locally for the animator
+        # S3/remote fallback: download and cache locally for the animator
         cache_path.parent.mkdir(parents=True, exist_ok=True)
-        data = await storage_service.download_file(avatar.s3_key)
+        data = await storage_service.download_file(preferred_key)
         cache_path.write_bytes(data)
         return str(cache_path)
 
@@ -436,7 +468,7 @@ class ConnectionManager:
 
     # ── handlers ──────────────────────────────────────────────────────────────
 
-    def _spawn_turn(self, session_id: str, coro) -> None:
+    def _spawn_turn(self, session_id: str, coro) -> asyncio.Task:
         """
         Register `coro` as the session's active turn and schedule it WITHOUT
         awaiting. This is the heart of barge-in: the WebSocket receive loop
@@ -448,6 +480,7 @@ class ConnectionManager:
         """
         task = asyncio.create_task(coro, name=f"turn-{session_id}")
         self._active_turns[session_id] = task
+        return task
 
         def _done(t: asyncio.Task) -> None:
             if self._active_turns.get(session_id) is t:

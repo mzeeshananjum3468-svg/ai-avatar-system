@@ -1,4 +1,6 @@
+import fnmatch
 import logging
+import tempfile
 from pathlib import Path
 from typing import Optional, Tuple
 
@@ -16,6 +18,78 @@ class AvatarProcessor:
 
     def __init__(self):
         self.resolution = settings.AVATAR_RESOLUTION
+
+    def cleanup_temp_files(self, temp_dir: Optional[str | Path] = None) -> int:
+        """Remove stale avatar temp artifacts from the system temp directory."""
+        target_dir = Path(temp_dir or tempfile.gettempdir())
+        if not target_dir.exists():
+            return 0
+
+        patterns = ("*_original.*", "*_processed.*", "*_thumb.*", "*.frame.jpg")
+        cleaned = 0
+        for file_path in target_dir.iterdir():
+            if not file_path.is_file():
+                continue
+            if any(fnmatch.fnmatch(file_path.name, pattern) for pattern in patterns):
+                file_path.unlink(missing_ok=True)
+                cleaned += 1
+
+        return cleaned
+
+    def _is_video_input(self, input_path: str, source_type: Optional[str] = None) -> bool:
+        if source_type == "video":
+            return True
+        if source_type == "image":
+            return False
+
+        suffix = Path(input_path).suffix.lower()
+        return suffix in {
+            ".mp4",
+            ".mov",
+            ".avi",
+            ".mkv",
+            ".webm",
+            ".m4v",
+            ".mpg",
+            ".mpeg",
+            ".wmv",
+        }
+
+    def _extract_first_frame(self, input_path: str, output_frame_path: Path) -> bool:
+        capture = cv2.VideoCapture(input_path)
+        try:
+            success, frame = capture.read()
+            if not success or frame is None:
+                return False
+
+            frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+            Image.fromarray(frame_rgb).save(output_frame_path, quality=95)
+            return True
+        finally:
+            capture.release()
+
+    async def process_media(
+        self, input_path: str, output_path: str, source_type: Optional[str] = None
+    ) -> Tuple[str, dict]:
+        """Process an uploaded image or extract the first frame from a video."""
+        if self._is_video_input(input_path, source_type):
+            logger.info(f"Processing avatar video: {input_path}")
+            temp_frame_path = Path(output_path).with_suffix(".frame.jpg")
+            temp_frame_path.parent.mkdir(parents=True, exist_ok=True)
+            if not self._extract_first_frame(input_path, temp_frame_path):
+                raise ValueError("Could not read a frame from the supplied video")
+            try:
+                output, metadata = await self.process_image(str(temp_frame_path), output_path)
+                metadata["source_type"] = "video"
+                metadata["source_path"] = input_path
+                return output, metadata
+            finally:
+                temp_frame_path.unlink(missing_ok=True)
+
+        output, metadata = await self.process_image(input_path, output_path)
+        metadata["source_type"] = source_type or "image"
+        metadata["source_path"] = input_path
+        return output, metadata
 
     async def process_image(self, image_path: str, output_path: str) -> Tuple[str, dict]:
         """
@@ -41,31 +115,24 @@ class AvatarProcessor:
             # Get original dimensions
             orig_width, orig_height = image.size
 
-            # Detect face and crop
+            # Detect face for metadata only — the full original picture is
+            # kept intact (no crop) since it's fed as-is to both MuseTalk
+            # (lip-sync) and LivePortrait (idle/thinking loops), and either
+            # one cropping the source before those models see it would
+            # discard parts of the picture the user actually uploaded.
             face_box = await self._detect_face(np.array(image))
-
             if face_box:
-                x, y, w, h = face_box
-                # Add padding
-                padding = int(min(w, h) * 0.3)
-                x = max(0, x - padding)
-                y = max(0, y - padding)
-                w = min(orig_width - x, w + 2 * padding)
-                h = min(orig_height - y, h + 2 * padding)
-
-                # Crop to face
-                image = image.crop((x, y, x + w, y + h))
-                logger.info(f"Face detected and cropped: {face_box}")
+                logger.info(f"Face detected: {face_box}")
             else:
-                logger.warning("No face detected, using center crop")
-                # Center crop
-                size = min(orig_width, orig_height)
-                left = (orig_width - size) // 2
-                top = (orig_height - size) // 2
-                image = image.crop((left, top, left + size, top + size))
+                logger.warning("No face detected in uploaded avatar image")
 
-            # Resize to target resolution
-            image = image.resize((self.resolution, self.resolution), Image.Resampling.LANCZOS)
+            # Downscale only if the image is larger than the configured cap,
+            # preserving the original aspect ratio — never crop or pad.
+            longest_side = max(orig_width, orig_height)
+            if longest_side > self.resolution:
+                scale = self.resolution / longest_side
+                new_size = (round(orig_width * scale), round(orig_height * scale))
+                image = image.resize(new_size, Image.Resampling.LANCZOS)
 
             # Enhance image
             image = await self._enhance_image(image)
@@ -82,7 +149,7 @@ class AvatarProcessor:
 
             metadata = {
                 "original_size": (orig_width, orig_height),
-                "processed_size": (self.resolution, self.resolution),
+                "processed_size": image.size,
                 "face_detected": face_box is not None,
                 "thumbnail_path": thumbnail_path,
             }

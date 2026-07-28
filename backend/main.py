@@ -130,12 +130,13 @@ app = FastAPI(
 )
 
 # Middleware (order matters — outermost first)
-app.add_middleware(SecurityHeadersMiddleware)
+# app.add_middleware(SecurityHeadersMiddleware)
 app.add_middleware(RequestLoggingMiddleware)
 app.add_middleware(RateLimitMiddleware)
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=settings.CORS_ORIGINS,
+    # allow_origins=settings.CORS_ORIGINS,
+    allow_origins =["*"],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -389,7 +390,7 @@ if __name__ == "__main__":
     uvicorn.run(
         "main:app",
         host="0.0.0.0",
-        port=8000,
+        port=8901,
         reload=settings.DEBUG,
         log_level=settings.LOG_LEVEL.lower(),
     )

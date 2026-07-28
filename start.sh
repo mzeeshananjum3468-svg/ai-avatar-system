@@ -159,9 +159,10 @@ if [[ -z "${ANTHROPIC_API_KEY:-}" && -z "${OPENAI_API_KEY:-}" ]]; then
 fi
 
 # Check MuseTalk lip-sync setup
+MUSETALK_PATH="${MUSETALK_PATH:-backend/models/MuseTalk}"
 _musetalk_ready() {
   [[ -f ".musetalk_ready" ]] && return 0
-  [[ -f "backend/models/MuseTalk/models/musetalkV15/unet.pth" ]] && return 0
+  [[ -f "$MUSETALK_PATH/models/musetalkV15/unet.pth" ]] && return 0
   return 1
 }
 

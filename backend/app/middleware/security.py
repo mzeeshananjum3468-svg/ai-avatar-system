@@ -35,7 +35,8 @@ def current_request_id() -> str:
 # injects a runtime stylesheet; everything else is locked down to same-origin.
 # `connect-src` allows WSS because the chat surface streams over WebSocket.
 # When you move to a CDN for static assets or fonts, add it here explicitly.
-_BASE_CSP = (
+# Strict CSP for production
+_BASE_CSP_PRODUCTION = (
     "default-src 'self'; "
     "img-src 'self' data: blob: https:; "
     "media-src 'self' blob: https:; "
@@ -47,6 +48,25 @@ _BASE_CSP = (
     "base-uri 'self'; "
     "form-action 'self'"
 )
+
+
+# Relaxed CSP for development (allows Swagger UI CDN)
+_BASE_CSP_DEVELOPMENT = (
+    "default-src 'self'; "
+    "img-src 'self' data: blob: https:; "
+    "media-src 'self' blob: https:; "
+    "style-src 'self' 'unsafe-inline' https://cdn.jsdelivr.net; "
+    "font-src 'self' data: https: https://cdn.jsdelivr.net; "
+    "script-src 'self' https://cdn.jsdelivr.net; "
+    "connect-src 'self' ws: wss: https:; "
+    "frame-ancestors 'none'; "
+    "base-uri 'self'; "
+    "form-action 'self'"
+)
+
+
+# Select CSP depending on environment
+_BASE_CSP = _BASE_CSP_DEVELOPMENT
 
 
 class SecurityHeadersMiddleware(BaseHTTPMiddleware):

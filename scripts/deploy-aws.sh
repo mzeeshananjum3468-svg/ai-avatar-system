@@ -84,7 +84,14 @@ if [ ! -f "$APP_DIR/.env.prod" ]; then
 fi
 
 # ── 5. Download MuseTalk models (first deploy only) ──────────────────────────
-if [ ! -f "$APP_DIR/backend/models/MuseTalk/models/musetalkV15/unet.pth" ]; then
+MUSETALK_PATH="${MUSETALK_PATH:-$APP_DIR/backend/models/MuseTalk}"
+if [[ "$MUSETALK_PATH" = /* ]]; then
+  MUSETALK_CHECKOUT="$MUSETALK_PATH"
+else
+  MUSETALK_CHECKOUT="$APP_DIR/$MUSETALK_PATH"
+fi
+
+if [ ! -f "$MUSETALK_CHECKOUT/models/musetalkV15/unet.pth" ]; then
   echo "[5/6] Downloading MuseTalk models (~9 GB, takes 5-10 min)..."
   bash "$APP_DIR/scripts/setup_musetalk.sh"
 else

@@ -1,0 +1,984 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Avatar Console — WS Test Client</title>
+<style>
+  :root{
+    --bg: #10151a;
+    --panel: #171e24;
+    --panel-2: #1d252c;
+    --line: #263038;
+    --text: #e7edf1;
+    --muted: #7f9099;
+    --teal: #4fd8c4;
+    --teal-dim: #2c6f66;
+    --amber: #f0a868;
+    --red: #e5686b;
+    --mono: 'JetBrains Mono', ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+    --sans: 'Inter', -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+  }
+  * { box-sizing: border-box; }
+  html, body { height: 100%; }
+  body{
+    margin:0; background: radial-gradient(1200px 800px at 15% -10%, #16232480 0%, transparent 60%), var(--bg);
+    color: var(--text); font-family: var(--sans); min-height:100vh;
+  }
+  .wrap{ max-width: 1180px; margin: 0 auto; padding: 22px 18px 60px; }
+
+  header.top{ display:flex; align-items:center; justify-content:space-between; margin-bottom:18px; gap:12px; flex-wrap:wrap;}
+  .brand{ display:flex; align-items:center; gap:10px; }
+  .brand .mark{ width:34px; height:34px; border-radius:8px; background: conic-gradient(from 180deg, var(--teal), var(--teal-dim), var(--teal)); position:relative; flex-shrink:0;}
+  .brand .mark::after{ content:""; position:absolute; inset:6px; background:var(--bg); border-radius:5px; }
+  .brand h1{ font-family: var(--mono); font-size:15px; letter-spacing:.08em; text-transform:uppercase; margin:0; font-weight:600;}
+  .brand p{ margin:0; font-size:11px; color:var(--muted); font-family: var(--mono); letter-spacing:.04em;}
+
+  .status-pill{ display:flex; align-items:center; gap:8px; font-family:var(--mono); font-size:12px; color:var(--muted);
+    background:var(--panel); border:1px solid var(--line); padding:7px 12px; border-radius:20px;}
+  .dot{ width:8px; height:8px; border-radius:50%; background:var(--muted); flex-shrink:0; transition: background .2s, box-shadow .2s;}
+  .dot.live{ background:var(--teal); box-shadow: 0 0 0 3px #4fd8c422;}
+  .dot.live.speaking{ background:var(--amber); box-shadow: 0 0 0 3px #f0a86822; animation: pulse 1s infinite ease-in-out;}
+  .dot.err{ background:var(--red); box-shadow: 0 0 0 3px #e5686b22;}
+  @keyframes pulse{ 0%,100%{ opacity:1;} 50%{ opacity:.45;} }
+
+  .grid{ display:grid; grid-template-columns: 1.1fr .9fr; gap:16px; }
+  @media (max-width: 880px){ .grid{ grid-template-columns: 1fr; } }
+
+  .panel{ background:var(--panel); border:1px solid var(--line); border-radius:14px; overflow:hidden; }
+  .panel-head{ padding:12px 16px; border-bottom:1px solid var(--line); font-family:var(--mono); font-size:11px;
+    letter-spacing:.08em; text-transform:uppercase; color:var(--muted); display:flex; align-items:center; justify-content:space-between;}
+
+  /* Config */
+  details.config{ margin-bottom:14px; }
+  details.config > summary{ list-style:none; cursor:pointer; font-family:var(--mono); font-size:12px; color:var(--muted);
+    padding:10px 14px; background:var(--panel); border:1px solid var(--line); border-radius:10px; display:flex; align-items:center; gap:8px; user-select:none;}
+  details.config > summary::-webkit-details-marker{ display:none; }
+  details.config > summary::before{ content:"▸"; color:var(--teal); transition: transform .15s; }
+  details.config[open] > summary::before{ transform: rotate(90deg); }
+  details.config[open] > summary{ border-bottom-left-radius:0; border-bottom-right-radius:0; }
+  .config-body{ background:var(--panel); border:1px solid var(--line); border-top:none; border-radius:0 0 10px 10px; padding:14px; }
+  .field-row{ display:grid; grid-template-columns: repeat(auto-fit, minmax(180px,1fr)); gap:10px; margin-bottom:10px;}
+  .field{ display:flex; flex-direction:column; gap:5px; }
+  .field label{ font-family:var(--mono); font-size:10px; color:var(--muted); letter-spacing:.06em; text-transform:uppercase;}
+  .field input, .field select{
+    background:var(--panel-2); border:1px solid var(--line); border-radius:7px; color:var(--text);
+    padding:8px 10px; font-family:var(--mono); font-size:12px; outline:none;
+  }
+  .field input:focus, .field select:focus{ border-color: var(--teal-dim); }
+  .hint{ font-size:11px; color:var(--muted); margin-top:2px; line-height:1.5;}
+  .subhead{ font-family:var(--mono); font-size:10px; color:var(--teal); letter-spacing:.08em; text-transform:uppercase; margin:14px 0 8px; padding-top:10px; border-top:1px dashed var(--line);}
+  .subhead:first-of-type{ border-top:none; padding-top:0; margin-top:0; }
+
+  /* Video panel */
+  .stage{ position:relative; background:#000; aspect-ratio: 854/480; width:100%; overflow:hidden;}
+  .stage video{
+    position:absolute; inset:0; width:100%; height:100%; object-fit:contain; background:#000;
+    opacity:0; transition: opacity 100ms linear;
+  }
+  .stage video.active{ opacity:1; }
+  .stage .overlay-tag{
+    position:absolute; top:10px; left:10px; font-family:var(--mono); font-size:11px; letter-spacing:.06em;
+    background:#00000090; border:1px solid #ffffff22; color: var(--amber); padding:5px 10px; border-radius:20px;
+    display:flex; align-items:center; gap:6px; opacity:0; transition:opacity .15s; pointer-events:none;
+  }
+  .stage .overlay-tag.show{ opacity:1; }
+  .stage .overlay-tag .dot{ background: var(--amber); animation: pulse 1s infinite ease-in-out; }
+  .stage .mode-tag{
+    position:absolute; top:10px; right:10px; font-family:var(--mono); font-size:11px; letter-spacing:.06em;
+    background:#00000090; border:1px solid #ffffff22; color: var(--teal); padding:5px 10px; border-radius:20px;
+  }
+
+  .queue-strip{ display:flex; align-items:center; gap:4px; padding:10px 14px; border-top:1px solid var(--line); flex-wrap:wrap; min-height:20px;}
+  .queue-strip .label{ font-family:var(--mono); font-size:10px; color:var(--muted); letter-spacing:.06em; text-transform:uppercase; margin-right:6px;}
+  .seg{ width:16px; height:8px; border-radius:2px; background:var(--line); flex-shrink:0; }
+  .seg.dl{ background: var(--teal-dim); }
+  .seg.ready{ background: var(--teal); }
+  .seg.playing{ background: var(--amber); animation: pulse .8s infinite ease-in-out; }
+
+  /* Controls under video */
+  .controls{ padding:14px 16px; border-top:1px solid var(--line); display:flex; flex-direction:column; gap:10px;}
+  .row{ display:flex; gap:8px; }
+  textarea#textInput{
+    flex:1; resize:none; background:var(--panel-2); border:1px solid var(--line); border-radius:9px; color:var(--text);
+    padding:10px 12px; font-family:var(--sans); font-size:13px; min-height:42px; max-height:120px; outline:none;
+  }
+  textarea#textInput:focus{ border-color: var(--teal-dim); }
+  button{ font-family:var(--mono); font-size:11px; letter-spacing:.05em; text-transform:uppercase; border-radius:9px;
+    border:1px solid var(--line); background:var(--panel-2); color:var(--text); padding:0 16px; cursor:pointer;
+    display:flex; align-items:center; gap:6px; transition: border-color .15s, background .15s; white-space:nowrap;}
+  button:hover:not(:disabled){ border-color: var(--teal-dim); }
+  button:disabled{ opacity:.4; cursor:not-allowed; }
+  button.primary{ background: var(--teal); color:#0a1210; border-color:var(--teal); font-weight:600;}
+  button.primary:hover:not(:disabled){ background:#63e2cf; }
+  button.warn{ background: var(--red); color:#1a0505; border-color:var(--red); font-weight:600;}
+  button.warn:hover:not(:disabled){ background:#f08688; }
+  button.rec.active{ background: var(--amber); color:#221200; border-color:var(--amber); }
+  button.icon{ padding:0 12px; }
+
+  .row.controls-bottom{ justify-content:space-between; align-items:center; }
+  .file-btn{ position:relative; overflow:hidden; }
+  .file-btn input[type=file]{ position:absolute; inset:0; opacity:0; cursor:pointer; }
+
+  /* Log panel */
+  .log{ height:520px; overflow-y:auto; padding:14px 16px; display:flex; flex-direction:column; gap:8px; font-size:13px; }
+  .log::-webkit-scrollbar{ width:8px; }
+  .log::-webkit-scrollbar-thumb{ background:var(--line); border-radius:4px; }
+  .entry{ display:flex; gap:8px; align-items:baseline; line-height:1.5; }
+  .entry .tag{ font-family:var(--mono); font-size:10px; text-transform:uppercase; letter-spacing:.05em; color:var(--muted);
+    flex-shrink:0; width:78px; text-align:right; padding-top:2px;}
+  .entry .body{ flex:1; word-break: break-word; }
+  .entry.status .tag{ color:var(--muted); }
+  .entry.transcription .tag{ color:#79a9e0; }
+  .entry.transcription .body{ color:#bcd4ef; }
+  .entry.token .tag{ color:var(--amber); }
+  .entry.chunk .tag{ color:var(--teal); }
+  .entry.chunk .body{ color:var(--muted); font-family:var(--mono); font-size:12px; }
+  .entry.message .tag{ color:var(--teal); }
+  .entry.message .body{ background:var(--panel-2); border:1px solid var(--line); border-radius:10px; padding:8px 10px; }
+  .entry.error .tag, .entry.error .body{ color:var(--red); }
+  .entry.user .tag{ color:#e7edf1; }
+  .entry.user .body{ background:#20303280; border:1px solid var(--teal-dim); border-radius:10px; padding:8px 10px; }
+  .entry.system .tag, .entry.system .body{ color:var(--muted); font-style:italic; }
+
+  .streaming-line{ color:var(--text); }
+
+  footer.note{ margin-top:16px; font-size:11px; color:var(--muted); font-family:var(--mono); line-height:1.7; }
+  footer.note b{ color:var(--amber); font-weight:600; }
+</style>
+</head>
+<body>
+<div class="wrap">
+
+  <header class="top">
+    <div class="brand">
+      <div class="mark"></div>
+      <div>
+        <h1>Avatar Console</h1>
+        <p>ws test client · barge-in enabled</p>
+      </div>
+    </div>
+    <div class="status-pill">
+      <span class="dot" id="statusDot"></span>
+      <span id="statusText">disconnected</span>
+    </div>
+  </header>
+
+  <details class="config" open>
+    <summary>Connection settings</summary>
+    <div class="config-body">
+      <div class="field-row">
+        <div class="field">
+          <label>Protocol</label>
+          <select id="wsProto"><option value="ws">ws://</option><option value="wss">wss://</option></select>
+        </div>
+        <div class="field">
+          <label>Host:Port</label>
+          <input id="wsHost" type="text" value="10.28.80.162:8901" spellcheck="false">
+        </div>
+        <div class="field">
+          <label>Session ID</label>
+          <input id="sessionId" type="text" value="f1ce868e-c036-45b7-a226-0536c5098c55" spellcheck="false">
+        </div>
+      </div>
+      <div class="field-row">
+        <div class="field" style="grid-column: 1 / -1;">
+          <label>Token</label>
+          <input id="tokenInput" type="text" value="eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJzdWIiOiI5M2ZmMDgwMy03MTUwLTQyZTItOTA4Zi0xZmE3Yzc2OTQwYjMiLCJleHAiOjE3ODQ4NzY5Nzh9.OKAvaj9BUq_mRx36coqK_Z3OT8hqcsAhZd8ZbhYk3UQ" spellcheck="false">
+        </div>
+      </div>
+      <div class="field-row">
+        <div class="field">
+          <label>Video base URL</label>
+          <input id="videoBase" type="text" value="http://10.28.80.162:8090/ai-avatar-system/backend" spellcheck="false">
+        </div>
+      </div>
+
+      <div class="subhead">Greeting / idle video (before first message, and after a response finishes)</div>
+      <div class="field-row">
+        <div class="field">
+          <label>Idle video URL</label>
+          <input id="idleUrlInput" type="text" placeholder="https://.../idle.mp4" spellcheck="false">
+        </div>
+        <div class="field">
+          <label>...or upload idle video</label>
+          <button class="file-btn icon" type="button">Choose file<input type="file" id="idleFileInput" accept="video/*"></button>
+        </div>
+      </div>
+
+      <div class="subhead">Thinking / loop video (shown between chunks, while waiting on a response)</div>
+      <div class="field-row">
+        <div class="field">
+          <label>Thinking video URL</label>
+          <input id="thinkingUrlInput" type="text" placeholder="https://.../thinking.mp4" spellcheck="false">
+        </div>
+        <div class="field">
+          <label>...or upload thinking video</label>
+          <button class="file-btn icon" type="button">Choose file<input type="file" id="thinkingFileInput" accept="video/*"></button>
+        </div>
+      </div>
+
+      <div class="hint">
+        The token/session values are prefilled from your script — they may be expired (short-lived JWT) and are visible in plain text here, so treat this page as local/dev-only, not something to share as-is.
+        The video base URL rewrites chunk URLs that point at <code>:8900</code> or <code>localhost:8000</code>, mirroring the Python client's <code>normalize_video_url</code>.
+        If no thinking video is set, the idle video is reused for that state as a fallback.
+      </div>
+    </div>
+  </details>
+
+  <div class="grid">
+    <!-- LEFT: video stage -->
+    <div class="panel">
+      <div class="panel-head">
+        <span>Avatar stream</span>
+        <span id="genLabel">gen 0</span>
+      </div>
+      <div class="stage">
+        <video id="videoA" class="active" playsinline muted></video>
+        <video id="videoB" playsinline muted></video>
+        <div class="overlay-tag" id="thinkingTag"><span class="dot"></span><span>thinking…</span></div>
+        <div class="mode-tag" id="modeTag">idle</div>
+      </div>
+      <div class="queue-strip">
+        <span class="label">Chunk queue</span>
+        <div id="queueSegs" style="display:flex; gap:4px; flex-wrap:wrap;"></div>
+      </div>
+      <div class="controls">
+        <div class="row">
+          <textarea id="textInput" placeholder="Type a message… (Enter to send, Shift+Enter for newline)"></textarea>
+        </div>
+        <div class="row controls-bottom">
+          <div class="row" style="gap:8px;">
+            <button id="sendBtn" class="primary">Send</button>
+            <button id="recBtn" class="rec">● Record</button>
+            <button class="file-btn icon" type="button">Upload audio<input type="file" id="audioFileInput" accept="audio/*"></button>
+          </div>
+          <div class="row" style="gap:8px;">
+            <button id="interruptBtn" class="warn" disabled>Interrupt</button>
+            <button id="connectBtn" class="primary">Connect</button>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <!-- RIGHT: log -->
+    <div class="panel">
+      <div class="panel-head">
+        <span>Session log</span>
+        <span id="chunkCount">0 chunks</span>
+      </div>
+      <div class="log" id="logEl"></div>
+    </div>
+  </div>
+
+  <footer class="note">
+    <b>Video states:</b> <code>idle</code> — greeting loop shown before the first message and after a response fully finishes.
+    <code>thinking</code> — loop shown once a request is in flight but no chunk is playing yet (right after Send, and in the gap
+    between two chunks if a chunk finishes downloading before the next one is ready). <code>chunk:N</code> — an actual response
+    chunk playing. The tag in the top-right of the stage shows which one is active.<br>
+    <b>Barge-in behaviour:</b> hitting Send (or Interrupt) while the avatar is speaking immediately clears the pending chunk queue,
+    snaps the player back to the idle loop, bumps the internal generation counter, and sends the new message on the same open socket —
+    matching the <code>run_barge_in</code> scenario in your test script. Chunks belonging to the interrupted response that are still
+    downloading get discarded on arrival instead of being enqueued.
+  </footer>
+
+</div>
+
+<script>
+(() => {
+  const $ = id => document.getElementById(id);
+
+  const els = {
+    wsProto: $('wsProto'), wsHost: $('wsHost'), sessionId: $('sessionId'), tokenInput: $('tokenInput'),
+    videoBase: $('videoBase'),
+    idleUrlInput: $('idleUrlInput'), idleFileInput: $('idleFileInput'),
+    thinkingUrlInput: $('thinkingUrlInput'), thinkingFileInput: $('thinkingFileInput'),
+    statusDot: $('statusDot'), statusText: $('statusText'),
+    videoA: $('videoA'), videoB: $('videoB'), thinkingTag: $('thinkingTag'), modeTag: $('modeTag'),
+    queueSegs: $('queueSegs'), genLabel: $('genLabel'), chunkCount: $('chunkCount'),
+    textInput: $('textInput'), sendBtn: $('sendBtn'), recBtn: $('recBtn'),
+    audioFileInput: $('audioFileInput'), interruptBtn: $('interruptBtn'), connectBtn: $('connectBtn'),
+    logEl: $('logEl'),
+  };
+
+  // ---------- state ----------
+  let ws = null;
+  let connected = false;
+  let currentGen = 0;
+  let isResponding = false;   // true while the current turn should show thinking/chunks instead of idle
+  let streamEnded = false;    // server has sent video_chunk_end/message for the current turn — pipeline may still be draining
+  let isPlayingChunk = false;
+  let totalChunksThisSession = 0;
+
+  let idleUrl = null;         // greeting loop: pre-first-message + post-response
+  let thinkingUrl = null;     // loop shown between chunks while a response is in flight
+  const downloadQueue = [];   // {index, url, gen}
+  let downloading = false;
+  const playQueue = [];       // {url, gen, index, objectUrl}
+
+  // ---------- dual video buffer (seamless swap, no black frame) ----------
+  // Two stacked <video> elements. The next source is always loaded into the
+  // offscreen one and only cross-faded into view once it can actually play,
+  // so the visible element never shows a blank/black frame while decoding.
+  const videoEls = [els.videoA, els.videoB];
+  let activeIdx = 0;
+  let swapToken = 0;              // bumped to invalidate an in-flight transition (e.g. on barge-in)
+  let prebufferedItem = null;     // chunk already decoded into the standby element, ready for an instant swap
+  let pendingChunkTransition = false; // true while the *current* chunk's own load is still in flight
+
+  function activeVideo() { return videoEls[activeIdx]; }
+  function standbyVideo() { return videoEls[1 - activeIdx]; }
+
+  // ---------- pendulum (ping-pong) playback for idle/thinking loops ----------
+  // Browsers don't support real reverse video playback (negative playbackRate
+  // is a no-op), so reverse is faked by scrubbing currentTime backwards on a
+  // rAF loop at real-time pace. Seeks are throttled to ~30fps so we're not
+  // issuing a decoder seek on every animation frame.
+  const PENDULUM_FRAME_INTERVAL = 1 / 30;
+  let pendulumEl = null;
+  let pendulumReversing = false;
+  let pendulumRaf = null;
+  let pendulumLastTs = null;
+  let pendulumAccum = 0;
+
+  function stopPendulum() {
+    if (pendulumRaf) cancelAnimationFrame(pendulumRaf);
+    pendulumEl = null;
+    pendulumReversing = false;
+    pendulumRaf = null;
+    pendulumLastTs = null;
+    pendulumAccum = 0;
+  }
+
+  function startPendulum(el) {
+    stopPendulum();
+    pendulumEl = el;
+    el.loop = false;
+    if (el.currentTime !== 0) el.currentTime = 0;
+    el.play().catch(() => {});
+  }
+
+  function resumePendulumOrPlay(el) {
+    if (pendulumEl === el) {
+      if (pendulumReversing) return; // rAF loop is already driving it
+      if (el.paused) el.play().catch(() => {});
+      return;
+    }
+    startPendulum(el);
+  }
+
+  function beginPendulumReverse(el) {
+    if (el !== pendulumEl) return;
+    pendulumReversing = true;
+    pendulumLastTs = null;
+    pendulumAccum = 0;
+    el.pause();
+    pendulumRaf = requestAnimationFrame(pendulumStep);
+  }
+
+  function pendulumStep(ts) {
+    const v = pendulumEl;
+    if (!v) return;
+    if (pendulumLastTs == null) pendulumLastTs = ts;
+    const dt = (ts - pendulumLastTs) / 1000;
+    pendulumLastTs = ts;
+    pendulumAccum += dt;
+    if (pendulumAccum >= PENDULUM_FRAME_INTERVAL) {
+      const step = pendulumAccum;
+      pendulumAccum = 0;
+      const t = v.currentTime - step;
+      if (t <= 0.001) {
+        v.currentTime = 0;
+        pendulumReversing = false;
+        pendulumRaf = null;
+        v.play().catch(() => {});
+        return;
+      }
+      v.currentTime = t;
+    }
+    pendulumRaf = requestAnimationFrame(pendulumStep);
+  }
+
+  function transitionTo(src, mode, opts = {}) {
+    const { loop = false, muted = true, objectUrl = null, isChunk = false, pendulum = false, onCommit = null } = opts;
+    const myToken = ++swapToken;
+    const standby = standbyVideo();
+    if (isChunk) pendingChunkTransition = true;
+
+    const commit = () => {
+      if (myToken !== swapToken) return; // superseded by a newer transition (e.g. barge-in)
+      if (isChunk) pendingChunkTransition = false;
+      const outgoing = activeVideo();
+      if (outgoing === pendulumEl) stopPendulum();
+      activeIdx = 1 - activeIdx;
+      const incoming = activeVideo(); // === standby
+      incoming.classList.add('active');
+      if (pendulum) { startPendulum(incoming); } else { incoming.play().catch(() => {}); }
+      outgoing.classList.remove('active');
+      outgoing.pause();
+      if (outgoing.dataset.objectUrl) {
+        URL.revokeObjectURL(outgoing.dataset.objectUrl);
+        delete outgoing.dataset.objectUrl;
+      }
+      if (onCommit) onCommit();
+    };
+
+    // Already showing this exact content on the active element — nothing to do.
+    if (activeVideo().dataset.mode === mode && activeVideo().src === src) {
+      if (isChunk) pendingChunkTransition = false;
+      return;
+    }
+
+    standby.loop = loop;
+    standby.muted = muted;
+    standby.dataset.mode = mode;
+    if (objectUrl) standby.dataset.objectUrl = objectUrl; else delete standby.dataset.objectUrl;
+
+    if (standby.src === src && standby.readyState >= 3) {
+      commit();
+      return;
+    }
+
+    const onReady = () => { cleanup(); commit(); };
+    const onError = () => { cleanup(); if (isChunk) pendingChunkTransition = false; log('error', 'video', `failed to load ${mode}`); };
+    function cleanup() {
+      standby.removeEventListener('canplay', onReady);
+      standby.removeEventListener('error', onError);
+    }
+    standby.addEventListener('canplay', onReady, { once: true });
+    standby.addEventListener('error', onError, { once: true });
+    standby.src = src;
+    standby.load();
+  }
+
+  // Look ahead: while a chunk is playing, silently load the next queued chunk
+  // into the standby element so the swap on "ended" is instant.
+  function prebufferNext() {
+    if (!isPlayingChunk) return;
+    if (pendingChunkTransition) return;
+    if (prebufferedItem) return;
+    if (playQueue.length === 0) return;
+    const item = playQueue[0]; // peek — don't consume until it actually plays
+    const standby = standbyVideo();
+    standby.loop = false;
+    standby.muted = false;
+    standby.dataset.mode = 'chunk:' + item.index;
+    standby.dataset.objectUrl = item.objectUrl;
+    standby.src = item.objectUrl;
+    standby.load();
+    const onReady = () => {
+      standby.removeEventListener('canplay', onReady);
+      if (playQueue[0] === item) {
+        prebufferedItem = item;
+        markSeg(item.index, 'ready');
+      }
+    };
+    standby.addEventListener('canplay', onReady, { once: true });
+  }
+
+  function commitPrebuffered(item) {
+    isPlayingChunk = true;
+    els.thinkingTag.classList.remove('show');
+    els.modeTag.textContent = 'chunk ' + item.index;
+    swapToken++; // invalidate any stray in-flight transitionTo commit
+    const outgoing = activeVideo();
+    if (outgoing === pendulumEl) stopPendulum();
+    activeIdx = 1 - activeIdx;
+    const incoming = activeVideo();
+    incoming.classList.add('active');
+    incoming.play().catch(() => {});
+    outgoing.classList.remove('active');
+    outgoing.pause();
+    if (outgoing.dataset.objectUrl) {
+      URL.revokeObjectURL(outgoing.dataset.objectUrl);
+      delete outgoing.dataset.objectUrl;
+    }
+    markSeg(item.index, 'playing');
+    prebufferNext();
+  }
+
+  // segments shown in the queue strip, keyed by chunk index within current gen
+  let segEls = {}; // index -> element
+
+  // ---------- helpers: log ----------
+  function log(type, tagText, bodyText) {
+    const row = document.createElement('div');
+    row.className = 'entry ' + type;
+    row.innerHTML = `<span class="tag">${tagText}</span><span class="body"></span>`;
+    row.querySelector('.body').textContent = bodyText;
+    els.logEl.appendChild(row);
+    els.logEl.scrollTop = els.logEl.scrollHeight;
+    return row;
+  }
+
+  let streamingRow = null; // for token streaming
+  function logTokenAppend(tok) {
+    if (!streamingRow) {
+      streamingRow = log('token', 'stream', '');
+      streamingRow.querySelector('.body').classList.add('streaming-line');
+    }
+    streamingRow.querySelector('.body').textContent += tok;
+    els.logEl.scrollTop = els.logEl.scrollHeight;
+  }
+  function endStreamingRow() { streamingRow = null; }
+
+  // ---------- helpers: status pill ----------
+  function setStatus(kind, text) {
+    els.statusDot.className = 'dot' + (kind === 'live' ? ' live' : kind === 'speaking' ? ' live speaking' : kind === 'err' ? ' err' : '');
+    els.statusText.textContent = text;
+  }
+
+  // ---------- URL normalization (mirrors python normalize_video_url) ----------
+  function normalizeVideoUrl(url) {
+    const base = els.videoBase.value.trim();
+    if (url.includes(':8900')) return base + url.split(':8900')[1];
+    if (url.includes('localhost:8000')) return base + url.split('localhost:8000')[1];
+    return url;
+  }
+
+  // ---------- greeting/idle video source ----------
+  els.idleFileInput.addEventListener('change', e => {
+    const f = e.target.files[0];
+    if (!f) return;
+    if (idleUrl && idleUrl.startsWith('blob:')) URL.revokeObjectURL(idleUrl);
+    idleUrl = URL.createObjectURL(f);
+    els.idleUrlInput.value = '';
+    log('system', 'idle', `local idle video set: ${f.name}`);
+    if (!isPlayingChunk) playLoop();
+  });
+  els.idleUrlInput.addEventListener('change', () => {
+    const v = els.idleUrlInput.value.trim();
+    if (v) {
+      idleUrl = v;
+      if (!isPlayingChunk) playLoop();
+    }
+  });
+
+  // ---------- thinking/loop video source ----------
+  els.thinkingFileInput.addEventListener('change', e => {
+    const f = e.target.files[0];
+    if (!f) return;
+    if (thinkingUrl && thinkingUrl.startsWith('blob:')) URL.revokeObjectURL(thinkingUrl);
+    thinkingUrl = URL.createObjectURL(f);
+    els.thinkingUrlInput.value = '';
+    log('system', 'thinking', `local thinking video set: ${f.name}`);
+    if (!isPlayingChunk) playLoop();
+  });
+  els.thinkingUrlInput.addEventListener('change', () => {
+    const v = els.thinkingUrlInput.value.trim();
+    if (v) {
+      thinkingUrl = v;
+      if (!isPlayingChunk) playLoop();
+    }
+  });
+
+  // Decide which loop applies right now: greeting/idle, or thinking (between chunks).
+  function currentLoop() {
+    if (isResponding) return { src: thinkingUrl || idleUrl, mode: 'thinking' };
+    return { src: idleUrl, mode: 'idle' };
+  }
+
+  function playLoop() {
+    els.thinkingTag.classList.toggle('show', isResponding);
+    const { src, mode } = currentLoop();
+    els.modeTag.textContent = mode;
+    if (!src) return; // nothing configured for this state yet
+    const active = activeVideo();
+    if (active.src === src) {
+      // Same underlying video already showing (e.g. thinking falling back to idle) — just relabel.
+      active.dataset.mode = mode;
+      resumePendulumOrPlay(active);
+      return;
+    }
+    transitionTo(src, mode, { loop: false, muted: true, pendulum: true });
+  }
+
+  function playChunk(item) {
+    isPlayingChunk = true;
+    els.thinkingTag.classList.remove('show');
+    els.modeTag.textContent = 'chunk ' + item.index;
+    transitionTo(item.objectUrl, 'chunk:' + item.index, {
+      loop: false, muted: false, objectUrl: item.objectUrl, isChunk: true,
+      onCommit: () => { markSeg(item.index, 'playing'); prebufferNext(); },
+    });
+  }
+
+  function onVideoEnded(e) {
+    const v = e.target;
+    if (v !== activeVideo()) return; // stale event from an element that's no longer showing
+    const mode = v.dataset.mode || '';
+    if (mode.startsWith('chunk:')) {
+      const idx = mode.split(':')[1];
+      markSeg(idx, 'done');
+      isPlayingChunk = false;
+      tryPlayNext();
+    } else if (v === pendulumEl && !pendulumReversing) {
+      beginPendulumReverse(v);
+    }
+  }
+  els.videoA.addEventListener('ended', onVideoEnded);
+  els.videoB.addEventListener('ended', onVideoEnded);
+
+  // True once nothing chunk-related is outstanding anywhere in the pipeline —
+  // not just "no queued chunk" (video_chunk_end fires as soon as the server has
+  // sent the chunk *messages*, which can land well before their HTTP fetches finish).
+  function pipelineDrained() {
+    return !isPlayingChunk && playQueue.length === 0 && downloadQueue.length === 0 && !downloading;
+  }
+
+  // Only actually leave "responding" once the server has said the turn is over
+  // AND the local pipeline has caught up — otherwise a chunk still in flight
+  // would get skipped over and drop straight to idle before it plays.
+  function maybeFinishResponding() {
+    if (streamEnded && pipelineDrained() && isResponding) {
+      isResponding = false;
+      setStatus(connected ? 'live' : 'idle', connected ? 'connected' : 'disconnected');
+      els.interruptBtn.disabled = true;
+    }
+  }
+
+  function tryPlayNext() {
+    if (isPlayingChunk) return;
+    if (playQueue.length === 0) { maybeFinishResponding(); playLoop(); return; }
+    const item = playQueue.shift();
+    if (prebufferedItem === item) {
+      prebufferedItem = null;
+      commitPrebuffered(item);
+    } else {
+      playChunk(item); // wasn't ready ahead of time — load then swap as soon as it can play
+    }
+  }
+
+  // ---------- queue strip UI ----------
+  function resetQueueStrip() {
+    els.queueSegs.innerHTML = '';
+    segEls = {};
+  }
+  function ensureSeg(index) {
+    if (segEls[index]) return segEls[index];
+    const s = document.createElement('div');
+    s.className = 'seg';
+    s.title = 'chunk ' + index;
+    els.queueSegs.appendChild(s);
+    segEls[index] = s;
+    return s;
+  }
+  function markSeg(index, state) {
+    const s = ensureSeg(index);
+    s.classList.remove('dl', 'ready', 'playing');
+    if (state === 'downloading') s.classList.add('dl');
+    if (state === 'ready') s.classList.add('ready');
+    if (state === 'playing') s.classList.add('playing');
+    // 'done' -> leave neutral (fallback base color)
+  }
+
+  // ---------- download worker ----------
+  function pumpDownloads() {
+    if (downloading || downloadQueue.length === 0) return;
+    downloading = true;
+    const item = downloadQueue.shift();
+    markSeg(item.index, 'downloading');
+    fetch(item.url)
+      .then(r => { if (!r.ok) throw new Error('HTTP ' + r.status); return r.blob(); })
+      .then(blob => {
+        if (item.gen !== currentGen) {
+          // stale response (superseded by barge-in) — discard
+          log('system', 'discard', `chunk ${item.index} arrived after interrupt — dropped`);
+        } else {
+          const objectUrl = URL.createObjectURL(blob);
+          playQueue.push({ ...item, objectUrl });
+          markSeg(item.index, 'ready');
+          tryPlayNext();
+          prebufferNext();
+        }
+      })
+      .catch(err => log('error', 'download', `chunk ${item.index}: ${err.message}`))
+      .finally(() => { downloading = false; pumpDownloads(); });
+  }
+
+  // ---------- barge-in / interrupt ----------
+  function interrupt(reasonLog) {
+    // Tell the backend to actually cancel the in-flight turn (LLM/TTS/animation task).
+    // Without this the server keeps generating and streaming chunks for the old turn
+    // even though the client has locally moved on — this applies whether the turn
+    // being interrupted was started by text or by audio, since both share this path.
+    if (connected && ws && ws.readyState === WebSocket.OPEN) {
+      ws.send(JSON.stringify({ type: 'stop' }));
+    }
+    currentGen += 1;
+    els.genLabel.textContent = 'gen ' + currentGen;
+    // drop anything queued/pending for the old generation
+    downloadQueue.length = 0;
+    while (playQueue.length) {
+      const it = playQueue.shift();
+      URL.revokeObjectURL(it.objectUrl);
+    }
+    prebufferedItem = null;
+    pendingChunkTransition = false;
+    swapToken++; // invalidate any in-flight transitionTo commit
+    isPlayingChunk = false;
+    stopPendulum();
+    videoEls.forEach(v => {
+      v.pause();
+      v.classList.remove('active');
+      if (v.dataset.objectUrl) { URL.revokeObjectURL(v.dataset.objectUrl); delete v.dataset.objectUrl; }
+      v.removeAttribute('src');
+      v.load();
+      delete v.dataset.mode;
+    });
+    activeIdx = 0;
+    videoEls[0].classList.add('active');
+    isResponding = false;
+    streamEnded = false;
+    resetQueueStrip();
+    endStreamingRow();
+    setStatus(connected ? 'live' : 'idle', connected ? 'connected' : 'disconnected');
+    playLoop();
+    els.interruptBtn.disabled = true;
+    if (reasonLog) log('system', 'barge-in', reasonLog);
+  }
+
+  // ---------- websocket ----------
+  function wsUrl() {
+    return `${els.wsProto.value}://${els.wsHost.value.trim()}/ws/session/${els.sessionId.value.trim()}?token=${els.tokenInput.value.trim()}`;
+  }
+
+  function connect() {
+    if (connected) { ws.close(); return; }
+    let url;
+    try { url = wsUrl(); } catch (e) { log('error', 'ws', 'bad URL config'); return; }
+    log('system', 'ws', `connecting → ${url}`);
+    ws = new WebSocket(url);
+
+    ws.onopen = () => {
+      connected = true;
+      setStatus('live', 'connected');
+      els.connectBtn.textContent = 'Disconnect';
+      log('system', 'ws', 'connected');
+      playLoop(); // show greeting loop as soon as we're live, before any message
+    };
+    ws.onclose = () => {
+      connected = false;
+      setStatus('idle', 'disconnected');
+      els.connectBtn.textContent = 'Connect';
+      els.interruptBtn.disabled = true;
+      log('system', 'ws', 'connection closed');
+    };
+    ws.onerror = () => {
+      setStatus('err', 'error');
+      log('error', 'ws', 'websocket error (see console)');
+    };
+    ws.onmessage = (evt) => {
+      let data;
+      try { data = JSON.parse(evt.data); } catch { log('error', 'ws', 'non-JSON message'); return; }
+      handleMessage(data);
+    };
+  }
+
+  function handleMessage(data) {
+    const type = data.type;
+    switch (type) {
+      case 'status':
+        isResponding = true;
+        streamEnded = false;
+        setStatus('speaking', data.message || 'thinking…');
+        els.interruptBtn.disabled = false;
+        if (!isPlayingChunk) playLoop(); // switch to thinking loop while we wait for the first chunk
+        log('status', 'status', data.message || '');
+        break;
+      case 'transcription':
+        log('transcription', 'you said', data.text || '');
+        break;
+      case 'token':
+        logTokenAppend(data.token || '');
+        break;
+      case 'video_chunk': {
+        totalChunksThisSession += 1;
+        els.chunkCount.textContent = totalChunksThisSession + ' chunks';
+        const rawUrl = normalizeVideoUrl(data.video_url);
+        const index = data.chunk_index ?? 0;
+        log('chunk', 'chunk ' + index, rawUrl);
+        ensureSeg(index);
+        downloadQueue.push({ index, url: rawUrl, gen: currentGen });
+        pumpDownloads();
+        break;
+      }
+      case 'video_chunk_end':
+        log('system', 'stream', `video complete — ${data.sent_chunks} chunks`);
+        streamEnded = true;
+        maybeFinishResponding(); // only actually drops to idle once every chunk has been fetched and played
+        if (!isPlayingChunk) playLoop();
+        break;
+      case 'message':
+        // Text stream finishing is independent of the video pipeline — the
+        // backend runs LLM streaming and TTS/animation concurrently, so
+        // `message` routinely arrives before the first (or any) video_chunk.
+        // Do NOT treat it as "turn over" here; only video_chunk_end may set
+        // streamEnded, otherwise we flip back to idle before the avatar has
+        // even started animating.
+        endStreamingRow();
+        log('message', 'assistant', data.content || '');
+        if (!isPlayingChunk) playLoop();
+        break;
+      case 'interrupted':
+        // Server-side ack that it actually cancelled the in-flight turn (in response to
+        // our explicit {type:'stop'} or an implicit barge-in from the next text/audio send).
+        log('system', 'server', data.message || 'previous response interrupted');
+        break;
+      case 'error':
+        log('error', 'server', JSON.stringify(data));
+        break;
+      default:
+        log('system', type || 'unknown', JSON.stringify(data));
+    }
+  }
+
+  // ---------- sending ----------
+  function sendPayload(payload, userLogText) {
+    if (!connected) { log('error', 'send', 'not connected'); return; }
+    if (isResponding || isPlayingChunk || playQueue.length || downloadQueue.length) {
+      interrupt(null); // silent barge-in, we log the user message right after
+    }
+    ws.send(JSON.stringify(payload));
+    log('user', 'you', userLogText);
+  }
+
+  function sendText() {
+    const text = els.textInput.value.trim();
+    if (!text) return;
+    sendPayload({ type: 'text', text }, text);
+    els.textInput.value = '';
+  }
+
+  async function sendAudioBase64(b64, label) {
+    sendPayload({ type: 'audio', audio: b64 }, label);
+  }
+
+  // ---------- audio: file upload (sent as-is, base64) ----------
+  els.audioFileInput.addEventListener('change', async (e) => {
+    const f = e.target.files[0];
+    if (!f) return;
+    const buf = await f.arrayBuffer();
+    const b64 = arrayBufferToBase64(buf);
+    await sendAudioBase64(b64, `[uploaded audio: ${f.name}]`);
+    e.target.value = '';
+  });
+
+  // ---------- audio: mic recording, re-encoded to WAV ----------
+  let mediaRecorder = null;
+  let recChunks = [];
+  let recording = false;
+
+  els.recBtn.addEventListener('click', async () => {
+    if (!recording) {
+      try {
+        const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+        recChunks = [];
+        mediaRecorder = new MediaRecorder(stream);
+        mediaRecorder.ondataavailable = e => { if (e.data.size) recChunks.push(e.data); };
+        mediaRecorder.onstop = async () => {
+          stream.getTracks().forEach(t => t.stop());
+          const blob = new Blob(recChunks, { type: mediaRecorder.mimeType || 'audio/webm' });
+          try {
+            const b64 = await blobToWavBase64(blob);
+            await sendAudioBase64(b64, '[mic recording]');
+          } catch (err) {
+            log('error', 'audio', 'failed to encode recording: ' + err.message);
+          }
+        };
+        mediaRecorder.start();
+        recording = true;
+        els.recBtn.classList.add('active');
+        els.recBtn.textContent = '■ Stop';
+      } catch (err) {
+        log('error', 'mic', err.message);
+      }
+    } else {
+      mediaRecorder.stop();
+      recording = false;
+      els.recBtn.classList.remove('active');
+      els.recBtn.textContent = '● Record';
+    }
+  });
+
+  // decode any recorded blob and re-encode as 16-bit PCM WAV
+  async function blobToWavBase64(blob) {
+    const arrayBuffer = await blob.arrayBuffer();
+    const AudioCtx = window.AudioContext || window.webkitAudioContext;
+    const ctx = new AudioCtx();
+    const audioBuffer = await ctx.decodeAudioData(arrayBuffer);
+    const wav = audioBufferToWav(audioBuffer);
+    ctx.close();
+    return arrayBufferToBase64(wav);
+  }
+
+  function audioBufferToWav(buffer) {
+    const numChannels = 1; // mix down to mono
+    const sampleRate = buffer.sampleRate;
+    const numFrames = buffer.length;
+    let mono;
+    if (buffer.numberOfChannels > 1) {
+      const ch0 = buffer.getChannelData(0);
+      const ch1 = buffer.getChannelData(1);
+      mono = new Float32Array(numFrames);
+      for (let i = 0; i < numFrames; i++) mono[i] = (ch0[i] + ch1[i]) / 2;
+    } else {
+      mono = buffer.getChannelData(0);
+    }
+
+    const bytesPerSample = 2;
+    const blockAlign = numChannels * bytesPerSample;
+    const dataSize = numFrames * blockAlign;
+    const bufferOut = new ArrayBuffer(44 + dataSize);
+    const view = new DataView(bufferOut);
+
+    function writeStr(offset, str) { for (let i = 0; i < str.length; i++) view.setUint8(offset + i, str.charCodeAt(i)); }
+
+    writeStr(0, 'RIFF');
+    view.setUint32(4, 36 + dataSize, true);
+    writeStr(8, 'WAVE');
+    writeStr(12, 'fmt ');
+    view.setUint32(16, 16, true);
+    view.setUint16(20, 1, true); // PCM
+    view.setUint16(22, numChannels, true);
+    view.setUint32(24, sampleRate, true);
+    view.setUint32(28, sampleRate * blockAlign, true);
+    view.setUint16(32, blockAlign, true);
+    view.setUint16(34, 16, true);
+    writeStr(36, 'data');
+    view.setUint32(40, dataSize, true);
+
+    let offset = 44;
+    for (let i = 0; i < numFrames; i++) {
+      let s = Math.max(-1, Math.min(1, mono[i]));
+      s = s < 0 ? s * 0x8000 : s * 0x7fff;
+      view.setInt16(offset, s, true);
+      offset += 2;
+    }
+    return bufferOut;
+  }
+
+  function arrayBufferToBase64(buf) {
+    const bytes = new Uint8Array(buf);
+    let binary = '';
+    const chunkSize = 0x8000;
+    for (let i = 0; i < bytes.length; i += chunkSize) {
+      binary += String.fromCharCode.apply(null, bytes.subarray(i, i + chunkSize));
+    }
+    return btoa(binary);
+  }
+
+  // ---------- wire up buttons ----------
+  els.connectBtn.addEventListener('click', connect);
+  els.sendBtn.addEventListener('click', sendText);
+  els.textInput.addEventListener('keydown', e => {
+    if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); sendText(); }
+  });
+  els.interruptBtn.addEventListener('click', () => interrupt('interrupted — back to idle loop'));
+
+  setStatus('idle', 'disconnected');
+  els.modeTag.textContent = 'idle';
+})();
+</script>
+</body>
+</html>

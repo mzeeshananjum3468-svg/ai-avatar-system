@@ -52,6 +52,14 @@ class Avatar(Base):
     image_url = Column(String, nullable=False)
     thumbnail_url = Column(String, nullable=True)
     s3_key = Column(String, nullable=False)
+    # Silent LivePortrait loop videos shown by the client while idle / while
+    # the LLM is generating a response, before any lip-synced chunk arrives.
+    # Nullable: generated asynchronously after upload. status stays
+    # "processing" (sessions.create_session rejects non-"ready" avatars)
+    # until both are attached, and flips to "failed" if LivePortrait isn't
+    # configured or generation errors out.
+    idle_video_url = Column(String, nullable=True)
+    thinking_video_url = Column(String, nullable=True)
     status = Column(String, default="processing")  # processing, ready, failed
     voice_id = Column(
         String, nullable=True, index=True

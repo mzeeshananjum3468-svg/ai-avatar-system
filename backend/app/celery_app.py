@@ -127,6 +127,19 @@ def cleanup_old_files_task():
     dirs_removed = 0
 
     try:
+        def _is_avatar_temp_file(path: Path) -> bool:
+            return path.is_file() and (
+                "_original" in path.name
+                or "_processed" in path.name
+                or "_thumb" in path.name
+                or ".frame." in path.name
+            )
+
+        for file_path in tmpdir.iterdir():
+            if _is_avatar_temp_file(file_path):
+                file_path.unlink(missing_ok=True)
+                total_cleaned += 1
+
         # Per-session working dirs (input audio + per-chunk wav/mp4).
         for session_dir in tmpdir.glob("avatar-session-*"):
             if not session_dir.is_dir():

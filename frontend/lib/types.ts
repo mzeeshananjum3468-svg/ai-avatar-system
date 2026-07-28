@@ -4,6 +4,8 @@ export interface Avatar {
   status: 'ready' | 'processing' | 'failed' | 'pending'
   thumbnail_url?: string
   image_url?: string
+  idle_video_url?: string | null
+  thinking_video_url?: string | null
   s3_key?: string
   voice_id?: string | null
   avatar_metadata?: {

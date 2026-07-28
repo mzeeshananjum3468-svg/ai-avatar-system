@@ -40,15 +40,16 @@ class SynthResult:
 
 # Microsoft neural voices for the Edge TTS fallback, one per supported
 # language (the same 23-language set the voices API allows). Anything not
-# listed falls back to the English voice.
+# listed falls back to the English voice. All female, so an un-cloned
+# fallback voice stays consistent with the default female persona.
 _EDGE_VOICES = {
     "ar": "ar-SA-ZariyahNeural",
     "da": "da-DK-ChristelNeural",
     "de": "de-DE-KatjaNeural",
     "el": "el-GR-AthinaNeural",
-    "en": "en-US-AriaNeural",
+    "en": "en-US-JennyNeural",
     "es": "es-ES-ElviraNeural",
-    "fi": "fi-FI-NooraNeural",
+    "fi": "fi-FI-SelmaNeural",
     "fr": "fr-FR-DeniseNeural",
     "he": "he-IL-HilaNeural",
     "hi": "hi-IN-SwaraNeural",
@@ -57,8 +58,8 @@ _EDGE_VOICES = {
     "ko": "ko-KR-SunHiNeural",
     "ms": "ms-MY-YasminNeural",
     "nl": "nl-NL-ColetteNeural",
-    "no": "nb-NO-PernilleNeural",
-    "pl": "pl-PL-ZofiaNeural",
+    "no": "nb-NO-IselinNeural",
+    "pl": "pl-PL-AgnieszkaNeural",
     "pt": "pt-BR-FranciscaNeural",
     "ru": "ru-RU-SvetlanaNeural",
     "sv": "sv-SE-SofieNeural",
@@ -71,6 +72,100 @@ _EDGE_VOICES = {
 # Treat them as chatterbox instead of breaking every synthesis call.
 _LEGACY_PROVIDER_ALIASES = {"coqui": "chatterbox", "xtts": "chatterbox", "xtts_v2": "chatterbox"}
 
+import torch
+
+def clean_audio(wav):
+    # Remove channel dimension if needed
+    if wav.dim() == 1:
+        wav = wav.unsqueeze(0)
+
+    # Remove DC offset
+    wav = wav - wav.mean()
+
+    # Normalize safely
+    peak = wav.abs().max()
+    if peak > 0:
+        wav = wav / peak * 0.95
+
+    sr = 24000
+
+    # Chatterbox (like most autoregressive TTS models) routinely tails off
+    # into several hundred ms of near-total digital silence after the last
+    # real phoneme — harmless for audio-only playback, but every one of
+    # those silent frames gets fed straight into MuseTalk's lip-sync model,
+    # which was never trained on long silent stretches and produces a
+    # visible mouth flutter for that whole span instead of holding still.
+    # Trim it here: playback loses the dead air, and lip-sync only ever
+    # sees real, speech-driven audio.
+    win = int(0.02 * sr)  # 20ms
+    if wav.shape[1] > win:
+        envelope = wav[0, : wav.shape[1] // win * win].reshape(-1, win).abs().mean(dim=1)
+        threshold = max(envelope.max().item() * 0.02, 1e-4)
+        above = (envelope > threshold).nonzero()
+        if len(above) > 0:
+            last_voiced_sample = (int(above[-1].item()) + 1) * win
+            # Keep a small natural tail instead of a hard cut.
+            tail_keep = int(0.15 * sr)
+            cut_at = min(last_voiced_sample + tail_keep, wav.shape[1])
+            wav = wav[:, :cut_at]
+
+    # Short fade in/out to remove clicks
+    fade_samples = min(int(0.01 * sr), wav.shape[1] // 2)
+    wav[:, :fade_samples] *= torch.linspace(
+        0, 1, fade_samples, device=wav.device
+    )
+    wav[:, -fade_samples:] *= torch.linspace(
+        1, 0, fade_samples, device=wav.device
+    )
+
+    return wav
+
+def _trim_trailing_silence(sound, keep_ms: int = 150):
+    """pydub counterpart of the trailing-silence trim in clean_audio() above,
+    for the edge-tts/gTTS fallback paths (mp3->wav via pydub, never touches
+    clean_audio's torch tensor). Same reasoning: trailing silence is harmless
+    for playback but every silent frame it spans gets fed straight into
+    MuseTalk's lip-sync model, which produces a visible mouth flutter for
+    silence it wasn't trained on. Edge/gTTS trail off far less than
+    Chatterbox, but this keeps behavior consistent across all engines."""
+    from pydub.silence import detect_leading_silence
+
+    trailing_silence_ms = detect_leading_silence(sound.reverse())
+    cut_at = len(sound) - trailing_silence_ms + keep_ms
+    return sound[: max(cut_at, keep_ms)]
+
+
+import re
+
+def clean_tts_text(text: str) -> str:
+    # Remove markdown
+    text = re.sub(r"[*_~`#>]", "", text)
+
+    # Remove URLs
+    text = re.sub(r"https?://\S+|www\.\S+", "", text)
+
+    # Remove emojis and unusual symbols
+    text = re.sub(r"[^\w\s.,!?'-]", "", text)
+
+    # Normalize repeated punctuation
+    text = re.sub(r"\.{2,}", ".", text)
+    text = re.sub(r"!{2,}", "!", text)
+    text = re.sub(r"\?{2,}", "?", text)
+
+    # Convert long dashes to pauses
+    text = text.replace("—", ", ")
+    text = text.replace("–", ", ")
+
+    # Remove brackets but keep words
+    text = re.sub(r"[\[\]\(\)\{\}]", "", text)
+
+    # Remove standalone punctuation lines
+    text = re.sub(r"(?m)^[\s.,!?;:'\"-]+$", "", text)
+
+    # Collapse whitespace
+    text = re.sub(r"\s+", " ", text)
+
+    return text.strip()
 
 class TTSService:
     """Text-to-Speech service. Lazy-loads the model on first synthesis."""
@@ -105,13 +200,15 @@ class TTSService:
 
             device = "cuda" if self._check_cuda() else "cpu"
             logger.info(f"Loading Chatterbox multilingual TTS on {device}...")
+            # logger.info("Zeeshan: Forcing an exception to test fallback")
+            # raise Exception("Demonstration exception for testing fallback")
             self.model = await asyncio.to_thread(
-                ChatterboxMultilingualTTS.from_pretrained, device=device
+                ChatterboxMultilingualTTS.from_pretrained, device=device,
             )
             logger.info(f"Chatterbox loaded (sr={self.model.sr}, device={device})")
 
-        except Exception as e:
-            logger.error(f"Failed to load Chatterbox: {e}")
+        except Exception :
+            logger.exception("Failed to load Chatterbox")
             raise
 
     async def synthesize(
@@ -147,11 +244,22 @@ class TTSService:
                 logger.warning(f"Speaker WAV not found: {speaker_wav!r} — using default voice")
                 speaker_wav = None
 
-            kwargs = {"language_id": language}
+            kwargs = {
+                "language_id": language,
+                "temperature": 0.6,        # default is likely higher; lower = more literal
+                "repetition_penalty": 1.3, # discourage token loops/tails
+                "cfg_weight": 0.4,         # if exposed — stronger text-conditioning
+            }
             if speaker_wav:
                 kwargs["audio_prompt_path"] = speaker_wav
 
+            text = clean_tts_text(text)
+            text = clean_tts_text(text)
+            if text and text[-1] not in ".!?":
+                text += "."
+
             wav = await asyncio.to_thread(self.model.generate, text, **kwargs)
+            wav = clean_audio(wav)
             await asyncio.to_thread(torchaudio.save, output_path, wav, self.model.sr)
 
             logger.info(
@@ -201,7 +309,9 @@ class TTSService:
 
         await edge_tts.Communicate(text, voice).save(mp3_path)
         await asyncio.to_thread(
-            lambda: AudioSegment.from_mp3(mp3_path).export(output_path, format="wav")
+            lambda: _trim_trailing_silence(AudioSegment.from_mp3(mp3_path)).export(
+                output_path, format="wav"
+            )
         )
         Path(mp3_path).unlink(missing_ok=True)
 
@@ -221,7 +331,9 @@ class TTSService:
                 lambda: gTTS(text=text, lang=language, slow=False).save(mp3_path)
             )
             await asyncio.to_thread(
-                lambda: AudioSegment.from_mp3(mp3_path).export(output_path, format="wav")
+                lambda: _trim_trailing_silence(AudioSegment.from_mp3(mp3_path)).export(
+                    output_path, format="wav"
+                )
             )
             Path(mp3_path).unlink(missing_ok=True)
 

@@ -6,12 +6,15 @@ In local mode files are saved under LOCAL_STORAGE_PATH and served via
 FastAPI StaticFiles at /uploads/...
 """
 
+
 import logging
 from pathlib import Path
 from typing import Optional
 
 from app.config import settings
 
+print("=== STORAGE LOADED ===")
+print("BACKEND_URL =", settings.BACKEND_URL)
 logger = logging.getLogger(__name__)
 
 
@@ -20,6 +23,7 @@ def _local_path(key: str) -> Path:
 
 
 def _local_url(key: str) -> str:
+    print(">>> BACKEND_URL FROM SETTINGS:", settings.BACKEND_URL)
     return f"{settings.BACKEND_URL}/uploads/{key}"
 
 

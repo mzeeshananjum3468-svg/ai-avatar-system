@@ -63,6 +63,7 @@ class STTService:
             raise ValueError(f"Unsupported STT provider: {self.provider}")
         if self.model is None:
             await self.initialize()
+            language = "en"  # Let Whisper auto-detect language on first call
         return await asyncio.to_thread(self._transcribe_sync, audio_data, language)
 
     def _decode_with_soundfile(self, audio_data: Union[bytes, str]) -> np.ndarray:

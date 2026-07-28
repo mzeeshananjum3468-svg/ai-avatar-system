@@ -6,6 +6,7 @@ from fastapi import APIRouter, Depends, HTTPException, Query, status
 from fastapi.responses import JSONResponse
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy import delete, select
 
 from app.api.v1.users import get_current_user
 from app.database import get_db
@@ -268,4 +269,48 @@ async def delete_session(
         logger.error(f"Failed to delete session: {e}")
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail="Failed to delete session"
+        )
+
+@router.delete("/{session_id}/messages", status_code=status.HTTP_204_NO_CONTENT)
+async def delete_session_messages(
+    session_id: str,
+    db: AsyncSession = Depends(get_db),
+    current_user: Optional[User] = Depends(get_current_user),
+):
+    """Delete all messages belonging to a session."""
+    try:
+        # Verify the session exists
+        result = await db.execute(select(Session).where(Session.id == session_id))
+        session = result.scalar_one_or_none()
+
+        if not session:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail="Session not found",
+            )
+
+        # Verify ownership
+        if session.user_id != _user_id(current_user):
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="Not authorised to modify this session",
+            )
+
+        # Bulk delete all messages
+        await db.execute(
+            delete(Message).where(Message.session_id == session_id)
+        )
+
+        await db.commit()
+
+        logger.info(f"Deleted all messages for session {session_id}")
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        await db.rollback()
+        logger.error(f"Failed to delete session messages: {e}")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Failed to delete session messages",
         )

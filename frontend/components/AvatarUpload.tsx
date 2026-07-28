@@ -9,6 +9,8 @@ import { api } from '@/lib/api'
 export function AvatarUpload() {
   const [dragActive, setDragActive] = useState(false)
   const [preview, setPreview] = useState<string | null>(null)
+  const [previewIsVideo, setPreviewIsVideo] = useState(false)
+  const [selectedFile, setSelectedFile] = useState<File | null>(null)
   const [fileName, setFileName] = useState<string>('')
   const [name, setName] = useState('')
   const [error, setError] = useState<string | null>(null)
@@ -19,6 +21,8 @@ export function AvatarUpload() {
     onSuccess: () => {
       toast.success('Avatar uploaded!', { icon: '✨' })
       setPreview(null)
+      setPreviewIsVideo(false)
+      setSelectedFile(null)
       setName('')
       setFileName('')
       setError(null)
@@ -49,8 +53,8 @@ export function AvatarUpload() {
   const processFile = (file: File) => {
     setError(null)
 
-    if (!file.type.startsWith('image/')) {
-      setError('Please upload a JPG, PNG, or WEBP image.')
+    if (!file.type.startsWith('image/') && !file.type.startsWith('video/')) {
+      setError('Please upload a JPG, PNG, WEBP, MP4, MOV, AVI, or WEBM file.')
       return
     }
 
@@ -59,32 +63,47 @@ export function AvatarUpload() {
       return
     }
 
+    setSelectedFile(file)
     setFileName(file.name)
     if (!name) setName(file.name.replace(/\.[^/.]+$/, ''))
 
+    if (preview && previewIsVideo && preview.startsWith('blob:')) {
+      URL.revokeObjectURL(preview)
+    }
+
+    if (file.type.startsWith('video/')) {
+      setPreview(URL.createObjectURL(file))
+      setPreviewIsVideo(true)
+      return
+    }
+
     const reader = new FileReader()
-    reader.onload = (e) => setPreview(e.target?.result as string)
+    reader.onload = (e) => {
+      setPreview(e.target?.result as string)
+      setPreviewIsVideo(false)
+    }
     reader.readAsDataURL(file)
   }
 
   const handleSubmit = () => {
-    if (!preview || !name.trim()) {
+    if (!selectedFile || !name.trim()) {
       setError('Please give your avatar a name.')
       return
     }
 
-    fetch(preview)
-      .then(res => res.blob())
-      .then(blob => {
-        const formData = new FormData()
-        formData.append('file', blob, fileName || 'avatar.jpg')
-        formData.append('name', name.trim())
-        uploadMutation.mutate(formData)
-      })
+    const formData = new FormData()
+    formData.append('file', selectedFile, fileName || (selectedFile.type.startsWith('video/') ? 'avatar.mp4' : 'avatar.jpg'))
+    formData.append('name', name.trim())
+    uploadMutation.mutate(formData)
   }
 
   const clearPreview = () => {
+    if (preview && previewIsVideo && preview.startsWith('blob:')) {
+      URL.revokeObjectURL(preview)
+    }
     setPreview(null)
+    setPreviewIsVideo(false)
+    setSelectedFile(null)
     setFileName('')
     setError(null)
   }
@@ -94,7 +113,7 @@ export function AvatarUpload() {
       {/* Header */}
       <div>
         <h2 className="text-xl font-bold text-white">Upload Avatar</h2>
-        <p className="text-sm text-gray-500 mt-0.5">JPG · PNG · WEBP · up to 10 MB</p>
+        <p className="text-sm text-gray-500 mt-0.5">Images or videos · JPG · PNG · WEBP · MP4 · MOV · AVI · WEBM · up to 10 MB</p>
       </div>
 
       <div className="divider" />
@@ -129,7 +148,7 @@ export function AvatarUpload() {
           <input
             type="file"
             id="avatar-upload"
-            accept="image/*"
+            accept="image/*,video/*"
             onChange={handleChange}
             className="absolute inset-0 w-full h-full opacity-0 cursor-pointer"
           />
@@ -151,7 +170,7 @@ export function AvatarUpload() {
 
             <div>
               <p className="text-white font-semibold text-base mb-1">
-                {dragActive ? 'Drop to upload' : 'Drag & drop your photo'}
+                {dragActive ? 'Drop to upload' : 'Drag & drop your photo or video'}
               </p>
               <p className="text-gray-500 text-sm">
                 or <span className="text-primary-400 font-medium underline underline-offset-2">click to browse</span>
@@ -169,11 +188,19 @@ export function AvatarUpload() {
       ) : (
         /* Preview */
         <div className="relative rounded-2xl overflow-hidden border border-white/10 group">
-          <img
-            src={preview}
-            alt="Avatar preview"
-            className="w-full max-h-64 object-cover"
-          />
+          {previewIsVideo ? (
+            <video
+              src={preview || undefined}
+              controls
+              className="w-full max-h-64 object-cover"
+            />
+          ) : (
+            <img
+              src={preview || undefined}
+              alt="Avatar preview"
+              className="w-full max-h-64 object-cover"
+            />
+          )}
           {/* Overlay */}
           <div className="absolute inset-0 bg-gradient-to-t from-surface-950/90 via-surface-950/20 to-transparent opacity-0 group-hover:opacity-100 transition-opacity duration-300" />
 
@@ -228,7 +255,7 @@ export function AvatarUpload() {
       {/* Processing note */}
       {uploadMutation.isPending && (
         <p className="text-xs text-center text-gray-500 animate-pulse">
-          Detecting face · Cropping · Optimizing…
+          Detecting face · Optimizing…
         </p>
       )}
     </div>

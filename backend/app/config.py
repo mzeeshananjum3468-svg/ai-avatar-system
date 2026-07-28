@@ -69,6 +69,18 @@ class Settings(BaseSettings):
     AVATAR_FPS: int = 25
     MUSETALK_PATH: str = "models/MuseTalk"
 
+    # Idle/thinking loop video generation (LivePortrait). Every value below is
+    # optional — leave blank to let LivePortraitService auto-discover the
+    # sibling ../../LivePortrait checkout, its conda env's python, and the
+    # driving videos shipped alongside this repo/MuseTalk. Set explicitly to
+    # override any of those on a host with a different layout.
+    LIVEPORTRAIT_PATH: str = ""
+    LIVEPORTRAIT_PYTHON: str = ""
+    # Driving video for the idle loop — defaults to MuseTalk's yongen.mp4.
+    IDLE_DRIVING_VIDEO: str = ""
+    # Driving video for the thinking loop — defaults to ai-avatar-system/source.mp4.
+    THINKING_DRIVING_VIDEO: str = ""
+
     # STT Configuration
     # large-v3-turbo: best 2026 sweet spot — ~216x real-time on GPU, multilingual,
     # only ~1% lower WER than large-v3. Falls back to base/small if VRAM is tight.
@@ -120,6 +132,9 @@ class Settings(BaseSettings):
     VIDEO_FPS: int = 25
     VIDEO_CODEC: str = "h264"
     VIDEO_BITRATE: str = "2000k"
+
+    #MuseTalk Settings
+    MUSETALK_TAIL_HOLD_FRAMES: int = 4
 
     # Monitoring
     SENTRY_DSN: Optional[str] = None

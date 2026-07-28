@@ -2,8 +2,8 @@
 
 import { useState, useEffect, useRef, useCallback } from 'react'
 import {
-  Send, Mic, MicOff, Video, Loader2, Volume2, VolumeX,
-  Sparkles, Clock, Copy, RotateCcw, Wand2,
+  Send, Mic, MicOff, Video, Volume2, VolumeX,
+  Sparkles, Clock, Copy, RotateCcw,
   MessageCircle, Zap, Activity, Download, Globe,
   Pencil, Trash2, Check, X, Keyboard, Plug, Square,
 } from 'lucide-react'
@@ -38,7 +38,25 @@ interface Message {
 interface VideoChunk {
   url: string
   text: string
+  index: number
 }
+
+interface DownloadItem {
+  index: number
+  url: string
+  gen: number
+}
+
+// Browsers don't support real reverse video playback (negative playbackRate
+// is a no-op), so the idle/thinking loops are faked by scrubbing currentTime
+// backwards on a rAF loop at real-time pace once the clip reaches its end —
+// a "pendulum" ping-pong. Seeks are throttled to ~30fps so we're not issuing
+// a decoder seek on every animation frame. Ported from test_client.html.
+const PENDULUM_FRAME_INTERVAL = 1 / 30
+// How often to re-poll the avatar record for idle/thinking video URLs while
+// LivePortrait generation is still running in the background after upload.
+const VIDEO_POLL_INTERVAL_MS = 5000
+const VIDEO_POLL_MAX_ATTEMPTS = 24 // ~2 minutes
 
 interface ChatInterfaceProps {
   avatarId: string
@@ -203,86 +221,408 @@ export function ChatInterface({ avatarId, voiceId, resumeSessionId, onSessionCre
   // backend rejected the handshake. Surfaces a "Reconnect" button in the UI.
   const [reconnectStalled, setReconnectStalled] = useState(false)
 
-  // Video playback state
-  const [showVideo, setShowVideo] = useState(false)           // true while a chunk is playing
+  // Video playback state — mirrors test_client.html's idle/thinking/chunk model.
+  const [isSpeaking, setIsSpeaking] = useState(false)          // true while an actual reply chunk is playing
+  const [loopMode, setLoopMode] = useState<'idle' | 'thinking'>('idle')
+  const [activeIdx, setActiveIdx] = useState(0)                // which of videoA/videoB is on top
   const [currentChunkProgress, setCurrentChunkProgress] = useState({ current: 0, total: 0 })
+  const [idleVideoUrl, setIdleVideoUrl] = useState<string | null>(null)
+  const [thinkingVideoUrl, setThinkingVideoUrl] = useState<string | null>(null)
 
-  // Chunk queue — managed via refs to avoid stale closures in event handlers
-  const chunkQueueRef = useRef<VideoChunk[]>([])
-  const isPlayingRef = useRef(false)
+  // ── Dual video buffer (seamless swap, no black frame) ──────────────────
+  // Two stacked <video> elements. The next source is always loaded into the
+  // offscreen one and only cross-faded into view once it can actually play.
+  const videoARef = useRef<HTMLVideoElement>(null)
+  const videoBRef = useRef<HTMLVideoElement>(null)
+  const activeIdxRef = useRef(0)
+  const swapTokenRef = useRef(0)          // bumped to invalidate an in-flight transition (e.g. on barge-in)
+  const prebufferedItemRef = useRef<VideoChunk | null>(null)
+  const pendingChunkTransitionRef = useRef(false)
+  const isPlayingChunkRef = useRef(false)
+  const playQueueRef = useRef<VideoChunk[]>([])
+  // Chunks are fetched into a Blob before being queued to play — mirrors
+  // test_client.html's downloadQueue/pumpDownloads. Playing straight off the
+  // remote URL let the very first chunk's transition start (and invalidate
+  // the in-flight "thinking" transition's swap token) before the thinking
+  // loop ever got to actually render a frame.
+  const downloadQueueRef = useRef<DownloadItem[]>([])
+  const downloadingRef = useRef(false)
+  const currentGenRef = useRef(0)         // bumped on barge-in to discard stale in-flight downloads
+  const isRespondingRef = useRef(false)   // server-side turn in flight (thinking or chunks)
+  const streamEndedRef = useRef(false)    // server sent video_chunk_end for the current turn
+  const idleUrlRef = useRef<string | null>(null)
+  const thinkingUrlRef = useRef<string | null>(null)
+  const isMutedRef = useRef(false)
 
-  const videoRef = useRef<HTMLVideoElement>(null)
-  // Hidden video element used to preload the next chunk while the current one plays
-  const preloadVideoRef = useRef<HTMLVideoElement>(null)
+  // Pendulum (ping-pong) reverse playback for idle/thinking loops.
+  const pendulumElRef = useRef<HTMLVideoElement | null>(null)
+  const pendulumReversingRef = useRef(false)
+  const pendulumRafRef = useRef<number | null>(null)
+  const pendulumLastTsRef = useRef<number | null>(null)
+  const pendulumAccumRef = useRef(0)
+
   const mediaRecorderRef = useRef<MediaRecorder | null>(null)
   const messagesEndRef = useRef<HTMLDivElement>(null)
   const audioContextRef = useRef<AudioContext | null>(null)
   const analyserRef = useRef<AnalyserNode | null>(null)
   const levelAnimRef = useRef<number | null>(null)
 
-  // ── Fetch avatar image on mount ──────────────────────────────────────────
+  // ── Fetch avatar image + idle/thinking loop videos on mount ─────────────
+  // idle_video_url/thinking_video_url are generated asynchronously in the
+  // background after upload (LivePortrait), so poll briefly until they show
+  // up rather than requiring a manual refresh.
   useEffect(() => {
-    api.getAvatars()
-      .then((avatars: Avatar[]) => {
-        const av = avatars.find((a: Avatar) => a.id === avatarId)
-        if (av) {
+    let cancelled = false
+    let attempts = 0
+    let timer: ReturnType<typeof setTimeout> | null = null
+
+    const fetchOnce = () => {
+      api.getAvatars()
+        .then((avatars: Avatar[]) => {
+          if (cancelled) return
+          const av = avatars.find((a: Avatar) => a.id === avatarId)
+          if (!av) { toast.error('Could not load avatar image'); return }
           setAvatarImageUrl(av.thumbnail_url || av.image_url || null)
-        } else {
-          toast.error('Could not load avatar image')
-        }
-      })
-      .catch(() => toast.error('Could not load avatar image'))
+          setIdleVideoUrl(av.idle_video_url || null)
+          setThinkingVideoUrl(av.thinking_video_url || null)
+          attempts += 1
+          const stillMissing = !av.idle_video_url && !av.thinking_video_url
+          if (stillMissing && attempts < VIDEO_POLL_MAX_ATTEMPTS) {
+            timer = setTimeout(fetchOnce, VIDEO_POLL_INTERVAL_MS)
+          }
+        })
+        .catch(() => { if (!cancelled) toast.error('Could not load avatar image') })
+    }
+    fetchOnce()
+
+    return () => { cancelled = true; if (timer) clearTimeout(timer) }
   }, [avatarId])
 
-  // ── Chunk queue player ───────────────────────────────────────────────────
-  const playNextChunk = useCallback(() => {
-    const next = chunkQueueRef.current.shift()
-    if (!next) {
-      isPlayingRef.current = false
-      setShowVideo(false)
+  function activeVideoEl() { return activeIdxRef.current === 0 ? videoARef.current : videoBRef.current }
+  function standbyVideoEl() { return activeIdxRef.current === 0 ? videoBRef.current : videoARef.current }
+
+  function stopPendulum() {
+    if (pendulumRafRef.current) cancelAnimationFrame(pendulumRafRef.current)
+    pendulumElRef.current = null
+    pendulumReversingRef.current = false
+    pendulumRafRef.current = null
+    pendulumLastTsRef.current = null
+    pendulumAccumRef.current = 0
+  }
+
+  function startPendulum(el: HTMLVideoElement) {
+    stopPendulum()
+    pendulumElRef.current = el
+    el.loop = false
+    if (el.currentTime !== 0) el.currentTime = 0
+    el.play().catch(() => {})
+  }
+
+  function resumePendulumOrPlay(el: HTMLVideoElement) {
+    if (pendulumElRef.current === el) {
+      if (pendulumReversingRef.current) return
+      if (el.paused) el.play().catch(() => {})
       return
     }
-    isPlayingRef.current = true
-    setShowVideo(true)
-    if (videoRef.current) {
-      videoRef.current.src = next.url
-      videoRef.current.muted = isMuted
-      // A rejected play() (autoplay policy, decode error) must not strand the
-      // queue — skip to the next chunk so playback can't hang on one bad clip.
-      videoRef.current.play().catch(() => {
-        if (chunkQueueRef.current.length > 0) playNextChunk()
-        else { isPlayingRef.current = false; setShowVideo(false) }
+    startPendulum(el)
+  }
+
+  function beginPendulumReverse(el: HTMLVideoElement) {
+    if (el !== pendulumElRef.current) return
+    pendulumReversingRef.current = true
+    pendulumLastTsRef.current = null
+    pendulumAccumRef.current = 0
+    el.pause()
+    pendulumRafRef.current = requestAnimationFrame(pendulumStep)
+  }
+
+  function pendulumStep(ts: number) {
+    const v = pendulumElRef.current
+    if (!v) return
+    if (pendulumLastTsRef.current == null) pendulumLastTsRef.current = ts
+    const dt = (ts - pendulumLastTsRef.current) / 1000
+    pendulumLastTsRef.current = ts
+    pendulumAccumRef.current += dt
+    if (pendulumAccumRef.current >= PENDULUM_FRAME_INTERVAL) {
+      const step = pendulumAccumRef.current
+      pendulumAccumRef.current = 0
+      const t = v.currentTime - step
+      if (t <= 0.001) {
+        v.currentTime = 0
+        pendulumReversingRef.current = false
+        pendulumRafRef.current = null
+        v.play().catch(() => {})
+        return
+      }
+      v.currentTime = t
+    }
+    pendulumRafRef.current = requestAnimationFrame(pendulumStep)
+  }
+
+  function transitionTo(src: string, mode: string, opts: {
+    loop?: boolean; muted?: boolean; isChunk?: boolean; pendulum?: boolean; objectUrl?: string | null; onCommit?: () => void
+  } = {}) {
+    const { loop = false, muted = true, isChunk = false, pendulum = false, objectUrl = null, onCommit } = opts
+    const active = activeVideoEl()
+    const standby = standbyVideoEl()
+    if (!active || !standby) return
+    const myToken = ++swapTokenRef.current
+    if (isChunk) pendingChunkTransitionRef.current = true
+
+    const commit = () => {
+      if (myToken !== swapTokenRef.current) return // superseded (e.g. barge-in)
+      if (isChunk) pendingChunkTransitionRef.current = false
+      const outgoing = activeVideoEl()!
+      if (outgoing === pendulumElRef.current) stopPendulum()
+      activeIdxRef.current = 1 - activeIdxRef.current
+      setActiveIdx(activeIdxRef.current)
+      const incoming = activeVideoEl()!
+      if (pendulum) startPendulum(incoming); else incoming.play().catch(() => {})
+      outgoing.pause()
+      if (outgoing.dataset.objectUrl) {
+        URL.revokeObjectURL(outgoing.dataset.objectUrl)
+        delete outgoing.dataset.objectUrl
+      }
+      onCommit?.()
+    }
+
+    if (active.dataset.mode === mode && active.src === src) {
+      if (isChunk) pendingChunkTransitionRef.current = false
+      return
+    }
+
+    standby.loop = loop
+    standby.muted = muted
+    standby.dataset.mode = mode
+    if (objectUrl) standby.dataset.objectUrl = objectUrl; else delete standby.dataset.objectUrl
+
+    if (standby.src === src && standby.readyState >= 3) { commit(); return }
+
+    const onReady = () => { cleanup(); commit() }
+    const onError = () => { cleanup(); if (isChunk) pendingChunkTransitionRef.current = false }
+    function cleanup() {
+      standby!.removeEventListener('canplay', onReady)
+      standby!.removeEventListener('error', onError)
+    }
+    standby.addEventListener('canplay', onReady, { once: true })
+    standby.addEventListener('error', onError, { once: true })
+    standby.src = src
+    standby.load()
+  }
+
+  // Decide which loop applies right now: idle, or thinking (falls back to idle).
+  function currentLoop(): { src: string | null; mode: 'idle' | 'thinking' } {
+    if (isRespondingRef.current) return { src: thinkingUrlRef.current || idleUrlRef.current, mode: 'thinking' }
+    return { src: idleUrlRef.current, mode: 'idle' }
+  }
+
+  function playLoop() {
+    const { src, mode } = currentLoop()
+    setLoopMode(mode)
+    if (!src) return // nothing generated yet for this avatar — placeholder stays up
+    const active = activeVideoEl()
+    if (!active) return
+    if (active.src === src) {
+      active.dataset.mode = mode
+      resumePendulumOrPlay(active)
+      return
+    }
+    transitionTo(src, mode, { loop: false, muted: true, pendulum: true })
+  }
+
+  // While a chunk is playing, silently load the next queued chunk into the
+  // standby element so the swap on "ended" is instant.
+  function prebufferNext() {
+    if (!isPlayingChunkRef.current) return
+    if (pendingChunkTransitionRef.current) return
+    if (prebufferedItemRef.current) return
+    if (playQueueRef.current.length === 0) return
+    const item = playQueueRef.current[0] // peek — don't consume until it actually plays
+    const standby = standbyVideoEl()
+    if (!standby) return
+    standby.loop = false
+    standby.muted = isMutedRef.current
+    standby.dataset.mode = 'chunk:' + item.index
+    standby.dataset.objectUrl = item.url
+    standby.src = item.url
+    standby.load()
+    const onReady = () => {
+      standby.removeEventListener('canplay', onReady)
+      if (playQueueRef.current[0] === item) prebufferedItemRef.current = item
+    }
+    standby.addEventListener('canplay', onReady, { once: true })
+  }
+
+  function commitPrebuffered(item: VideoChunk) {
+    isPlayingChunkRef.current = true
+    setIsSpeaking(true)
+    swapTokenRef.current++ // invalidate any stray in-flight transitionTo commit
+    const outgoing = activeVideoEl()!
+    if (outgoing === pendulumElRef.current) stopPendulum()
+    activeIdxRef.current = 1 - activeIdxRef.current
+    setActiveIdx(activeIdxRef.current)
+    const incoming = activeVideoEl()!
+    incoming.play().catch(() => {})
+    outgoing.pause()
+    if (outgoing.dataset.objectUrl) {
+      URL.revokeObjectURL(outgoing.dataset.objectUrl)
+      delete outgoing.dataset.objectUrl
+    }
+    prebufferNext()
+  }
+
+  function playChunk(item: VideoChunk) {
+    isPlayingChunkRef.current = true
+    setIsSpeaking(true)
+    transitionTo(item.url, 'chunk:' + item.index, {
+      loop: false, muted: isMutedRef.current, isChunk: true, objectUrl: item.url,
+      onCommit: () => prebufferNext(),
+    })
+  }
+
+  // True once nothing chunk-related is outstanding — not just "queue empty":
+  // video_chunk_end fires as soon as the server has sent the chunk messages,
+  // which can land well before the last one finishes downloading and playing.
+  function pipelineDrained() {
+    return !isPlayingChunkRef.current && playQueueRef.current.length === 0
+      && downloadQueueRef.current.length === 0 && !downloadingRef.current
+  }
+
+  // Fetch each chunk's video into a Blob before it's eligible to play — a
+  // real network round-trip that gives the "thinking" loop transition time
+  // to actually commit a frame before the chunk swap supersedes it. Ported
+  // from test_client.html's pumpDownloads/downloadQueue.
+  function pumpDownloads() {
+    if (downloadingRef.current || downloadQueueRef.current.length === 0) return
+    downloadingRef.current = true
+    const item = downloadQueueRef.current.shift()!
+    fetch(item.url)
+      .then((r) => { if (!r.ok) throw new Error('HTTP ' + r.status); return r.blob() })
+      .then((blob) => {
+        if (item.gen !== currentGenRef.current) return // stale — superseded by barge-in
+        const objectUrl = URL.createObjectURL(blob)
+        playQueueRef.current.push({ url: objectUrl, text: '', index: item.index })
+        if (!isPlayingChunkRef.current) {
+          if (sendTimeRef.current) setLatencyMs(Date.now() - sendTimeRef.current)
+          tryPlayNext()
+        } else {
+          prebufferNext()
+        }
       })
-    }
-    // Preload the next chunk in queue (if any)
-    const upcoming = chunkQueueRef.current[0]
-    if (upcoming && preloadVideoRef.current) {
-      preloadVideoRef.current.src = upcoming.url
-    }
-  }, [isMuted])
+      .catch(() => { /* dropped — mirrors test_client.html's discard-on-error */ })
+      .finally(() => { downloadingRef.current = false; pumpDownloads() })
+  }
 
-  // Attach ended + error handlers to the video element. The error handler is
-  // critical: a 404 / expired presigned URL / undecodable chunk fires `error`
-  // (not `ended`), so without this the whole reply hangs on one bad chunk.
-  useEffect(() => {
-    const video = videoRef.current
-    if (!video) return
-    const onEnded = () => playNextChunk()
-    const onError = () => {
-      if (chunkQueueRef.current.length > 0) playNextChunk()
-      else { isPlayingRef.current = false; setShowVideo(false) }
+  // Only actually leave "responding" once the server says the turn is over
+  // AND the local pipeline has caught up — otherwise a chunk still in flight
+  // would get skipped over and drop straight to idle before it plays.
+  function maybeFinishResponding() {
+    if (streamEndedRef.current && pipelineDrained() && isRespondingRef.current) {
+      isRespondingRef.current = false
+      setIsProcessing(false)
     }
-    video.addEventListener('ended', onEnded)
-    video.addEventListener('error', onError)
+  }
+
+  function tryPlayNext() {
+    if (isPlayingChunkRef.current) return
+    if (playQueueRef.current.length === 0) { maybeFinishResponding(); playLoop(); return }
+    const item = playQueueRef.current.shift()!
+    if (prebufferedItemRef.current === item) {
+      prebufferedItemRef.current = null
+      commitPrebuffered(item)
+    } else {
+      playChunk(item)
+    }
+  }
+
+  // Full barge-in reset: drop queued/downloading chunks, snap back to the idle loop.
+  function resetPlayback() {
+    currentGenRef.current += 1 // any in-flight download's .then() will discard itself
+    playQueueRef.current.forEach((item) => URL.revokeObjectURL(item.url))
+    playQueueRef.current = []
+    downloadQueueRef.current = []
+    prebufferedItemRef.current = null
+    pendingChunkTransitionRef.current = false
+    swapTokenRef.current++
+    isPlayingChunkRef.current = false
+    setIsSpeaking(false)
+    stopPendulum()
+    ;[videoARef.current, videoBRef.current].forEach((v) => {
+      if (!v) return
+      v.pause()
+      if (v.dataset.objectUrl) {
+        URL.revokeObjectURL(v.dataset.objectUrl)
+        delete v.dataset.objectUrl
+      }
+      v.removeAttribute('src')
+      v.load()
+      delete v.dataset.mode
+    })
+    activeIdxRef.current = 0
+    setActiveIdx(0)
+    isRespondingRef.current = false
+    streamEndedRef.current = false
+    setCurrentChunkProgress({ current: 0, total: 0 })
+    playLoop()
+  }
+
+  // Attach ended/error handlers once on mount. These only ever touch refs
+  // and stable setState identities, so a stale render closure is harmless —
+  // functionally identical to test_client.html's one-shot IIFE wiring.
+  useEffect(() => {
+    const onEndedFactory = (el: HTMLVideoElement | null) => () => {
+      if (!el || el !== activeVideoEl()) return
+      const mode = el.dataset.mode || ''
+      if (mode.startsWith('chunk:')) {
+        isPlayingChunkRef.current = false
+        setIsSpeaking(false)
+        tryPlayNext()
+      } else if (el === pendulumElRef.current && !pendulumReversingRef.current) {
+        beginPendulumReverse(el)
+      }
+    }
+    const onErrorFactory = (el: HTMLVideoElement | null) => () => {
+      const mode = el?.dataset.mode || ''
+      if (mode.startsWith('chunk:')) {
+        isPlayingChunkRef.current = false
+        setIsSpeaking(false)
+        tryPlayNext()
+      }
+    }
+    const a = videoARef.current
+    const b = videoBRef.current
+    const onEndedA = onEndedFactory(a)
+    const onEndedB = onEndedFactory(b)
+    const onErrorA = onErrorFactory(a)
+    const onErrorB = onErrorFactory(b)
+    a?.addEventListener('ended', onEndedA)
+    a?.addEventListener('error', onErrorA)
+    b?.addEventListener('ended', onEndedB)
+    b?.addEventListener('error', onErrorB)
     return () => {
-      video.removeEventListener('ended', onEnded)
-      video.removeEventListener('error', onError)
+      a?.removeEventListener('ended', onEndedA)
+      a?.removeEventListener('error', onErrorA)
+      b?.removeEventListener('ended', onEndedB)
+      b?.removeEventListener('error', onErrorB)
     }
-  }, [playNextChunk])
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [])
 
-  // Sync muted state to video element
+  // Sync idle/thinking URLs into refs and (re)apply once they load in.
   useEffect(() => {
-    if (videoRef.current) videoRef.current.muted = isMuted
+    idleUrlRef.current = idleVideoUrl
+    thinkingUrlRef.current = thinkingVideoUrl
+    if (!isPlayingChunkRef.current) playLoop()
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [idleVideoUrl, thinkingVideoUrl])
+
+  // Sync muted state to refs + whichever chunk is currently active (loops stay muted always).
+  useEffect(() => {
+    isMutedRef.current = isMuted
+    const active = activeVideoEl()
+    if (active && (active.dataset.mode || '').startsWith('chunk:')) {
+      active.muted = isMuted
+    }
   }, [isMuted])
 
   // Auto-scroll chat
@@ -356,6 +696,7 @@ export function ChatInterface({ avatarId, voiceId, resumeSessionId, onSessionCre
       if (voiceId) {
         websocket.send(JSON.stringify({ type: 'set_voice', voice_id: voiceId }))
       }
+      playLoop() // show the idle loop as soon as we're live, before any message
     }
     websocket.onmessage = (event) => {
       handleWebSocketMessage(JSON.parse(event.data))
@@ -426,48 +767,46 @@ export function ChatInterface({ avatarId, voiceId, resumeSessionId, onSessionCre
           timestamp: new Date(),
           emotion: detectEmotion(content),
         }])
-        // Keep isProcessing=true — spinner stays until first video chunk arrives
+        // isResponding stays true — the thinking/chunk pipeline (not this
+        // text event) decides when the turn is actually over.
+        if (!isPlayingChunkRef.current) playLoop()
         break
       }
 
       case 'video_chunk_start':
-        chunkQueueRef.current = []
+        playQueueRef.current = []
+        downloadQueueRef.current = []
         setCurrentChunkProgress({ current: 0, total: data.total_chunks })
         break
 
       case 'video_chunk': {
-        const chunk: VideoChunk = { url: data.video_url, text: data.text }
-        chunkQueueRef.current.push(chunk)
+        downloadQueueRef.current.push({ index: data.chunk_index, url: data.video_url, gen: currentGenRef.current })
         setCurrentChunkProgress(prev => ({ current: data.chunk_index + 1, total: prev.total }))
-        // First chunk arriving → record latency, clear spinner, start playback
-        if (!isPlayingRef.current) {
-          if (sendTimeRef.current) setLatencyMs(Date.now() - sendTimeRef.current)
-          setIsProcessing(false)
-          playNextChunk()
-        } else {
-          // Already playing — preload this incoming chunk
-          const upcoming = chunkQueueRef.current[0]
-          if (upcoming && preloadVideoRef.current && preloadVideoRef.current.src !== upcoming.url) {
-            preloadVideoRef.current.src = upcoming.url
-          }
-        }
+        pumpDownloads()
         break
       }
 
       case 'video_chunk_end':
-        // If nothing ever played (all chunks failed), clear spinner
-        if (!isPlayingRef.current) setIsProcessing(false)
+        streamEndedRef.current = true
+        // Only actually drops to idle once every chunk has been fetched and played.
+        maybeFinishResponding()
+        if (!isPlayingChunkRef.current) playLoop()
         break
 
       case 'status':
+        isRespondingRef.current = true
+        streamEndedRef.current = false
         setIsProcessing(true)
         setStatusMsg(data.message || 'Processing…')
+        if (!isPlayingChunkRef.current) playLoop() // switch to the thinking loop while we wait
         break
 
       case 'error':
         toast.error(data.message)
+        isRespondingRef.current = false
         setIsProcessing(false)
         setIsTyping(false)
+        if (!isPlayingChunkRef.current) playLoop()
         break
 
       case 'tts_fallback':
@@ -481,13 +820,7 @@ export function ChatInterface({ avatarId, voiceId, resumeSessionId, onSessionCre
         // Backend cancelled the previous turn because the user spoke again
         // (barge-in). Stop playback, clear the buffer, and let the new turn
         // start cleanly. We don't show a toast — barge-in should be silent.
-        chunkQueueRef.current = []
-        isPlayingRef.current = false
-        setShowVideo(false)
-        if (videoRef.current) {
-          videoRef.current.pause()
-          videoRef.current.src = ''
-        }
+        resetPlayback()
         setIsProcessing(false)
         setIsTyping(false)
         setStreamingContent('')
@@ -496,7 +829,8 @@ export function ChatInterface({ avatarId, voiceId, resumeSessionId, onSessionCre
       case 'pong':
         break
     }
-  }, [playNextChunk])
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [])
 
   const sendMessage = () => {
     if (!inputText.trim() || !ws || !sessionId) return
@@ -504,6 +838,11 @@ export function ChatInterface({ avatarId, voiceId, resumeSessionId, onSessionCre
       // send() on a CONNECTING socket throws; on CLOSED it silently drops.
       toast.error('Not connected to the avatar yet — try again in a moment.')
       return
+    }
+    // Implicit barge-in: sending while a previous turn is still in flight
+    // cancels it locally right away (mirrors test_client.html's sendPayload).
+    if (isRespondingRef.current || isPlayingChunkRef.current || playQueueRef.current.length) {
+      resetPlayback()
     }
     const emotion = detectEmotion(inputText)
     ws.send(JSON.stringify({ type: 'text', text: inputText }))
@@ -520,9 +859,9 @@ export function ChatInterface({ avatarId, voiceId, resumeSessionId, onSessionCre
     setIsTyping(true)
     setLatencyMs(null)
     sendTimeRef.current = Date.now()
-    chunkQueueRef.current = []
-    isPlayingRef.current = false
-    setShowVideo(false)
+    isRespondingRef.current = true
+    streamEndedRef.current = false
+    playLoop()
   }
 
   // Barge-in: tell the backend to cancel the in-flight turn and stop playback
@@ -531,13 +870,7 @@ export function ChatInterface({ avatarId, voiceId, resumeSessionId, onSessionCre
     if (ws && ws.readyState === WebSocket.OPEN) {
       ws.send(JSON.stringify({ type: 'stop' }))
     }
-    chunkQueueRef.current = []
-    isPlayingRef.current = false
-    setShowVideo(false)
-    if (videoRef.current) {
-      videoRef.current.pause()
-      videoRef.current.src = ''
-    }
+    resetPlayback()
     setIsProcessing(false)
     setIsTyping(false)
     setStreamingContent('')
@@ -595,13 +928,17 @@ export function ChatInterface({ avatarId, voiceId, resumeSessionId, onSessionCre
         reader.onloadend = () => {
           const base64Audio = (reader.result as string).split(',')[1]
           if (ws && ws.readyState === WebSocket.OPEN) {
+            // Implicit barge-in, same as sendMessage.
+            if (isRespondingRef.current || isPlayingChunkRef.current || playQueueRef.current.length) {
+              resetPlayback()
+            }
             setLatencyMs(null)
             sendTimeRef.current = Date.now()
             ws.send(JSON.stringify({ type: 'audio', audio: base64Audio }))
             setIsProcessing(true)
-            chunkQueueRef.current = []
-            isPlayingRef.current = false
-            setShowVideo(false)
+            isRespondingRef.current = true
+            streamEndedRef.current = false
+            playLoop()
           }
         }
         reader.readAsDataURL(audioBlob)
@@ -621,10 +958,7 @@ export function ChatInterface({ avatarId, voiceId, resumeSessionId, onSessionCre
   }
 
   const resetVideo = () => {
-    chunkQueueRef.current = []
-    isPlayingRef.current = false
-    setShowVideo(false)
-    if (videoRef.current) videoRef.current.src = ''
+    resetPlayback()
   }
 
   const copyMessage = (content: string) => {
@@ -738,10 +1072,20 @@ export function ChatInterface({ avatarId, voiceId, resumeSessionId, onSessionCre
       setWsConnected(false)
 
       // Release media resources so navigating away mid-playback/recording
-      // doesn't leak: a still-playing <video>, an open AudioContext, and a
-      // running rAF loop all survive unmount otherwise.
-      const video = videoRef.current
-      if (video) { video.pause(); video.removeAttribute('src'); video.load() }
+      // doesn't leak: still-playing <video> elements, an open AudioContext,
+      // and running rAF loops (playback + pendulum) all survive unmount otherwise.
+      const videoA = videoARef.current
+      const videoB = videoBRef.current
+      ;[videoA, videoB].forEach((video) => {
+        if (!video) return
+        video.pause()
+        if (video.dataset.objectUrl) URL.revokeObjectURL(video.dataset.objectUrl)
+        video.removeAttribute('src')
+        video.load()
+      })
+      playQueueRef.current.forEach((item) => URL.revokeObjectURL(item.url))
+      playQueueRef.current = []
+      stopPendulum()
       if (levelAnimRef.current !== null) cancelAnimationFrame(levelAnimRef.current)
       if (audioContextRef.current && audioContextRef.current.state !== 'closed') {
         audioContextRef.current.close().catch(() => {})
@@ -754,7 +1098,9 @@ export function ChatInterface({ avatarId, voiceId, resumeSessionId, onSessionCre
   // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [])
 
-  const isSpeaking = showVideo && !isProcessing
+  // Fallback breathing-image placeholder only while this avatar has neither
+  // loop video yet (e.g. LivePortrait generation still running in the background).
+  const showPlaceholder = !idleVideoUrl && !thinkingVideoUrl
 
   return (
     <div className="grid grid-cols-1 lg:grid-cols-5 gap-6 h-[calc(100vh-10rem)]">
@@ -769,37 +1115,39 @@ export function ChatInterface({ avatarId, voiceId, resumeSessionId, onSessionCre
           {/* Main display area */}
           <div className="aspect-video w-full bg-surface-950 rounded-xl overflow-hidden relative">
 
-            {/* ── Idle avatar (always mounted, hidden when video plays) ── */}
+            {/* ── Placeholder (only when this avatar has no idle/thinking loop yet) ── */}
             <div
               className="absolute inset-0 transition-opacity duration-500"
-              style={{ opacity: showVideo ? 0 : 1, zIndex: showVideo ? 0 : 5 }}
+              style={{ opacity: showPlaceholder ? 1 : 0, zIndex: showPlaceholder ? 5 : 0 }}
             >
               <IdleAvatar imageUrl={avatarImageUrl} />
             </div>
 
-            {/* ── Video element (mounted always; shown only when playing) ── */}
+            {/* ── Dual video buffer: idle/thinking loops + reply chunks cross-fade
+                 between these two elements with no black frame in between ── */}
+            {/* `muted` is intentionally NOT a controlled prop here — it's driven
+                imperatively by the playback engine (loops always muted, chunks
+                follow isMuted) via refs. Binding it through JSX would make React
+                force it back on every re-render and permanently silence chunks. */}
             <video
-              ref={videoRef}
-              className="absolute inset-0 w-full h-full object-cover transition-opacity duration-500"
-              style={{ opacity: showVideo ? 1 : 0, zIndex: showVideo ? 5 : 0 }}
-              autoPlay
+              ref={videoARef}
+              className="absolute inset-0 w-full h-full object-cover transition-opacity duration-100"
+              style={{ opacity: !showPlaceholder && activeIdx === 0 ? 1 : 0, zIndex: activeIdx === 0 ? 5 : 4 }}
               playsInline
-              muted={isMuted}
             />
-            {/* Hidden preload video — buffers the next chunk while current plays */}
-            <video ref={preloadVideoRef} className="hidden" preload="auto" muted />
+            <video
+              ref={videoBRef}
+              className="absolute inset-0 w-full h-full object-cover transition-opacity duration-100"
+              style={{ opacity: !showPlaceholder && activeIdx === 1 ? 1 : 0, zIndex: activeIdx === 1 ? 5 : 4 }}
+              playsInline
+            />
 
-            {/* ── Processing overlay ── */}
-            {isProcessing && (
-              <div className="absolute inset-0 bg-surface-950/75 backdrop-blur-sm flex flex-col
-                              items-center justify-center gap-4 z-20">
-                <div className="relative">
-                  <div className="w-16 h-16 rounded-full border-2 border-primary-500/30 animate-spin-slow" />
-                  <div className="absolute inset-2 rounded-full border-2 border-t-primary-400
-                                  border-r-transparent border-b-transparent border-l-transparent animate-spin" />
-                  <Wand2 className="absolute inset-0 m-auto text-primary-400" size={20} />
-                </div>
-                <p className="text-sm text-gray-300 font-medium animate-pulse">{statusMsg}</p>
+            {/* ── "thinking…" tag — shown while a turn is in flight but no reply chunk is playing yet ── */}
+            {!showPlaceholder && loopMode === 'thinking' && !isSpeaking && (
+              <div className="absolute top-3 left-3 z-30 flex items-center gap-1.5 bg-black/50
+                              backdrop-blur-sm px-2.5 py-1.5 rounded-full border border-white/10">
+                <span className="w-1.5 h-1.5 rounded-full bg-amber-400 animate-pulse" />
+                <span className="text-[10px] text-gray-200 font-medium">{statusMsg}</span>
               </div>
             )}
 
@@ -857,7 +1205,7 @@ export function ChatInterface({ avatarId, voiceId, resumeSessionId, onSessionCre
                 </select>
               </div>
 
-              {(showVideo || isProcessing) && (
+              {(isSpeaking || isProcessing) && (
                 <button onClick={resetVideo} className="btn-icon" title="Reset video" aria-label="Reset video">
                   <RotateCcw size={15} />
                 </button>

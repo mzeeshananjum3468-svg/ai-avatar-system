@@ -6,13 +6,15 @@ set -e
 PROJECT_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 BACKEND_DIR="$PROJECT_ROOT/backend"
 MODELS_DIR="$BACKEND_DIR/models"
-MUSETALK_DIR="$MODELS_DIR/MuseTalk"
-VENV_PYTHON="$BACKEND_DIR/venv/bin/python"
+MUSETALK_DIR="${MUSETALK_PATH:-$MODELS_DIR/MuseTalk}"
+export MUSETALK_SOURCE_PATH="${MUSETALK_SOURCE_PATH:-/media/muhammadfaisal/Data3/Zeeshan/MuseTalk}"
+# VENV_PYTHON="$BACKEND_DIR/venv/bin/python"
 SENTINEL="$PROJECT_ROOT/.musetalk_ready"
 
-if [ ! -f "$VENV_PYTHON" ]; then
-  VENV_PYTHON="python3"
-fi
+# Use the currently active environment (conda env)
+VENV_PYTHON="$(which python)"
+
+echo "Using Python: $VENV_PYTHON"
 
 echo "=== MuseTalk V1.5 Setup ==="
 echo "Project : $PROJECT_ROOT"
@@ -20,40 +22,59 @@ echo "Backend : $BACKEND_DIR"
 echo "Python  : $VENV_PYTHON"
 echo ""
 
-# ── 1. Clone MuseTalk ────────────────────────────────────────────────────────
+# ── 1. Locate or clone MuseTalk ──────────────────────────────────────────────
 if [ -d "$MUSETALK_DIR/.git" ]; then
-  echo "[1/5] MuseTalk already cloned — pulling latest..."
+  echo "[1/5] MuseTalk checkout already exists — pulling latest..."
   git -C "$MUSETALK_DIR" pull --ff-only
+elif [ -d "$MUSETALK_DIR" ] && [ -f "$MUSETALK_DIR/scripts/inference.py" ]; then
+  echo "[1/5] Using existing MuseTalk checkout at $MUSETALK_DIR"
 else
   echo "[1/5] Cloning MuseTalk..."
-  mkdir -p "$MODELS_DIR"
+  mkdir -p "$(dirname "$MUSETALK_DIR")"
   git clone https://github.com/TMElyralab/MuseTalk.git "$MUSETALK_DIR"
 fi
 
 # ── 2. Install Python dependencies ──────────────────────────────────────────
 echo ""
-echo "[2/5] Installing MuseTalk requirements..."
+# echo "[2/5] Installing MuseTalk requirements..."
 
 # Install requirements, skipping packages incompatible with Python 3.12
 # (mmpose/mmcv have no 3.12 wheels; tensorflow is optional for our use case)
-"$VENV_PYTHON" -m pip install -q \
-  "diffusers==0.32.2" \
-  "accelerate==0.28.0" \
-  "transformers==4.39.2" \
-  "opencv-python==4.9.0.80" \
-  "soundfile==0.12.1" \
-  "librosa==0.11.0" \
-  "einops==0.8.1" \
-  "omegaconf" \
-  "pyyaml" \
-  "imageio" \
-  "imageio[ffmpeg]" \
-  "ffmpeg-python" \
-  "moviepy<2" \
-  "mediapipe" \
-  "face-alignment" \
-  "safetensors" \
+
+echo "[2/5] Checking MuseTalk dependencies..."
+
+REQUIRED_PKGS=(
+  "mediapipe"
   "timm"
+)
+
+for pkg in "${REQUIRED_PKGS[@]}"; do
+    if "$VENV_PYTHON" -m pip show "$pkg" >/dev/null 2>&1; then
+        echo "  $pkg already installed ✓"
+    else
+        echo "  Installing $pkg..."
+        "$VENV_PYTHON" -m pip install "$pkg"
+    fi
+done
+
+# "$VENV_PYTHON" -m pip install \
+#   "diffusers==0.32.2" \
+#   "accelerate==0.28.0" \
+#   "transformers==4.39.2" \
+#   "opencv-python==4.9.0.80" \
+#   "soundfile==0.12.1" \
+#   "librosa==0.11.0" \
+#   "einops==0.8.1" \
+#   "omegaconf" \
+#   "pyyaml" \
+#   "imageio" \
+#   "imageio[ffmpeg]" \
+#   "ffmpeg-python" \
+#   "moviepy<2" \
+#   "mediapipe" \
+#   "face-alignment" \
+#   "safetensors" \
+#   "timm"
 
 # ── 3. Replace preprocessing.py with CPU-compatible version ─────────────────
 echo ""
@@ -147,20 +168,48 @@ def get_bbox_range(img_list, upperbondrange=0):
 PYEOF
 echo "  preprocessing.py replaced ✓"
 
+# ── 3b. Install our persistent worker into the active MuseTalk checkout ────
+echo ""
+echo "[3b/5] Installing persistent MuseTalk worker (musetalk_worker.py)..."
+WORKER_SRC="$PROJECT_ROOT/backend/models/MuseTalk/scripts/musetalk_worker.py"
+WORKER_DST="$MUSETALK_DIR/scripts/musetalk_worker.py"
+if [ -f "$WORKER_SRC" ]; then
+  cp "$WORKER_SRC" "$WORKER_DST"
+  echo "  Worker copied from tracked repo copy ✓"
+else
+  echo "  WARNING: worker source not found at $WORKER_SRC"
+  echo "  MuseTalk can still run if $WORKER_DST already exists."
+fi
+
 # ── 4. Download model weights from HuggingFace ──────────────────────────────
 echo ""
-echo "[4/5] Downloading MuseTalk model weights (~8.8 GB total)..."
+echo "[4/5] Ensuring MuseTalk model weights are available..."
 
 # gdown is required for the Google Drive face parsing model
-"$VENV_PYTHON" -m pip install -q gdown
+"$VENV_PYTHON" -m pip install gdown
 
 "$VENV_PYTHON" - "$MUSETALK_DIR" << 'PYEOF'
 from huggingface_hub import snapshot_download
-import os, sys, urllib.request, subprocess
+import os, sys, urllib.request, subprocess, shutil
+from pathlib import Path
 
 musetalk_dir = sys.argv[1]
 models_target = os.path.join(musetalk_dir, "models")
 os.makedirs(models_target, exist_ok=True)
+
+source_dir = Path(os.environ.get("MUSETALK_SOURCE_PATH", "")).expanduser()
+required_models = ("dwpose", "face-parse-bisent", "musetalkV15", "sd-vae", "whisper")
+has_source_weights = source_dir.is_dir() and all(
+    (source_dir / "models" / name).is_dir() for name in required_models
+) and (source_dir / "models" / "musetalkV15" / "unet.pth").is_file()
+if has_source_weights:
+  print(f"  Copying MuseTalk weights from {source_dir}...")
+  for name in required_models:
+    src = source_dir / "models" / name
+    dst = Path(models_target) / name
+    shutil.copytree(src, dst, dirs_exist_ok=True)
+  print("  Local MuseTalk weights copied.")
+  raise SystemExit(0)
 
 # ── MuseTalk weights (unet + VAE) ────────────────────────────────────────────
 print("  Downloading TMElyralab/MuseTalk weights (~7 GB)...")

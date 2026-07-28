@@ -4,20 +4,23 @@ import uuid
 from pathlib import Path
 from typing import List, Optional
 
-from fastapi import APIRouter, Depends, File, Form, HTTPException, Query, UploadFile, status
+from fastapi import APIRouter, BackgroundTasks, Depends, File, Form, HTTPException, Query, UploadFile, status
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.api.v1.users import get_current_user
-from app.database import get_db
+from app.database import AsyncSessionLocal, get_db
 from app.models import Avatar, User
 from app.schemas import AvatarMetadataUpdate, AvatarRename, AvatarResponse
 from app.services.avatar_processor import avatar_processor
+from app.services.liveportrait import liveportrait_service
 from app.services.storage import storage_service
 
 logger = logging.getLogger(__name__)
 router = APIRouter()
 TMPDIR = Path(tempfile.gettempdir())
+IMAGE_EXTENSIONS = (".jpg", ".jpeg", ".png", ".webp", ".bmp", ".gif")
+VIDEO_EXTENSIONS = (".mp4", ".mov", ".avi", ".mkv", ".webm", ".m4v", ".mpg", ".mpeg", ".wmv")
 
 
 def _user_id(current_user: Optional[User]) -> str:
@@ -38,31 +41,133 @@ def _validate_uuid(avatar_id: str) -> None:
         raise HTTPException(status_code=404, detail="Avatar not found")
 
 
+def _detect_media_type(content_type: Optional[str], filename: Optional[str]) -> str:
+    content_type = (content_type or "").lower()
+    filename = (filename or "").lower()
+
+    if content_type.startswith("image/") or any(filename.endswith(ext) for ext in IMAGE_EXTENSIONS):
+        return "image"
+    if content_type.startswith("video/") or any(filename.endswith(ext) for ext in VIDEO_EXTENSIONS):
+        return "video"
+
+    raise HTTPException(
+        status_code=400,
+        detail="File must be an image or video (JPG, PNG, WEBP, MP4, MOV, AVI, WEBM)",
+    )
+
+
+async def _set_avatar_fields(avatar_id: str, **fields) -> None:
+    async with AsyncSessionLocal() as db:
+        result = await db.execute(select(Avatar).where(Avatar.id == avatar_id))
+        avatar = result.scalar_one_or_none()
+        if avatar is None:
+            # Avatar was deleted while generation was in flight.
+            return
+        for key, value in fields.items():
+            setattr(avatar, key, value)
+        await db.commit()
+
+
+async def _generate_idle_thinking_videos(avatar_id: str, image_key: str) -> None:
+    """Background job: run LivePortrait to build the idle/thinking loop
+    videos for a freshly-uploaded avatar, then flip it to "ready" once both
+    are attached. The avatar is created with status="processing" and
+    sessions.create_session refuses to start a chat until it reaches
+    "ready", so a half-built avatar (missing either loop video) can never be
+    used.
+
+    Scheduled to run after the upload response has already gone out, so a
+    failure here (LivePortrait not installed, GPU OOM, etc.) never surfaces
+    to the uploading request — the avatar is instead marked "failed".
+    """
+    if not liveportrait_service.available:
+        logger.warning(f"LivePortrait unavailable — marking avatar {avatar_id} failed")
+        await _set_avatar_fields(avatar_id, status="failed")
+        return
+
+    temp_image = TMPDIR / f"{avatar_id}_liveportrait_source.jpg"
+    idle_path: Optional[str] = None
+    thinking_path: Optional[str] = None
+    try:
+        temp_image.write_bytes(await storage_service.download_file(image_key))
+
+        idle_path, thinking_path = await liveportrait_service.generate_idle_and_thinking(
+            str(temp_image), avatar_id
+        )
+        if not idle_path or not thinking_path:
+            await _set_avatar_fields(avatar_id, status="failed")
+            return
+
+        idle_url = await storage_service.upload_file(
+            Path(idle_path).read_bytes(), f"avatars/{avatar_id}/idle.mp4", content_type="video/mp4"
+        )
+        thinking_url = await storage_service.upload_file(
+            Path(thinking_path).read_bytes(),
+            f"avatars/{avatar_id}/thinking.mp4",
+            content_type="video/mp4",
+        )
+
+        await _set_avatar_fields(
+            avatar_id,
+            idle_video_url=idle_url,
+            thinking_video_url=thinking_url,
+            status="ready",
+        )
+
+        logger.info(f"Idle/thinking videos ready for avatar {avatar_id}")
+    except Exception:
+        logger.exception(f"Failed to generate idle/thinking videos for avatar {avatar_id}")
+        await _set_avatar_fields(avatar_id, status="failed")
+    finally:
+        temp_image.unlink(missing_ok=True)
+        if idle_path:
+            Path(idle_path).unlink(missing_ok=True)
+        if thinking_path:
+            Path(thinking_path).unlink(missing_ok=True)
+
+
 @router.post("/upload", response_model=AvatarResponse, status_code=status.HTTP_201_CREATED)
 async def upload_avatar(
+    background_tasks: BackgroundTasks,
     name: str = Form(...),
     file: UploadFile = File(...),
     db: AsyncSession = Depends(get_db),
     current_user: Optional[User] = Depends(get_current_user),
 ):
-    """Upload and process an avatar image."""
-    if not file.content_type or not file.content_type.startswith("image/"):
-        raise HTTPException(status_code=400, detail="File must be an image (JPG, PNG, WEBP)")
+    """Upload and process an avatar image or video."""
+    source_type = _detect_media_type(file.content_type, file.filename)
 
     file_data: bytes = await file.read()  # type: ignore[assignment]
     if len(file_data) > 10 * 1024 * 1024:
         raise HTTPException(status_code=400, detail="File must be under 10 MB")
 
     avatar_id = str(uuid.uuid4())
-    suffix = Path(file.filename or "avatar.jpg").suffix or ".jpg"
+    suffix = Path(file.filename or ("avatar.mp4" if source_type == "video" else "avatar.jpg")).suffix.lower()
+    if not suffix:
+        suffix = ".mp4" if source_type == "video" else ".jpg"
     temp_orig = TMPDIR / f"{avatar_id}_original{suffix}"
     temp_processed = TMPDIR / f"{avatar_id}_processed.jpg"
     metadata: dict = {}
+    source_key = f"avatars/{avatar_id}/source{suffix}"
+    source_content_type = file.content_type or ("video/mp4" if source_type == "video" else "image/jpeg")
 
     try:
+        avatar_processor.cleanup_temp_files(TMPDIR)
         temp_orig.write_bytes(file_data)
 
-        _, metadata = await avatar_processor.process_image(str(temp_orig), str(temp_processed))
+        source_url = await storage_service.upload_file(
+            file_data,
+            source_key,
+            content_type=source_content_type,
+        )
+
+        _, metadata = await avatar_processor.process_media(
+            str(temp_orig), str(temp_processed), source_type=source_type
+        )
+
+        metadata["source_type"] = source_type
+        metadata["source_url"] = source_url
+        metadata["source_key"] = source_key
 
         image_key = f"avatars/{avatar_id}/image.jpg"
         image_url = await storage_service.upload_file(
@@ -108,19 +213,30 @@ async def upload_avatar(
             if thumb_file.is_file():
                 thumb_file.unlink(missing_ok=True)
 
+    avatar_storage_key = source_key if source_type == "video" else image_key
+    avatar_storage_url = source_url if source_type == "video" else image_url
+
     avatar = Avatar(
         id=avatar_id,
         user_id=_user_id(current_user),
         name=name,
-        image_url=image_url,
+        image_url=avatar_storage_url,
         thumbnail_url=thumbnail_url,
-        s3_key=image_key,
-        status="ready",
+        s3_key=avatar_storage_key,
+        status="processing",
         avatar_metadata=metadata,
     )
     db.add(avatar)
     await db.commit()
     await db.refresh(avatar)
+
+    # Kick off idle/thinking loop video generation in the background — the
+    # image is already in storage, so this only needs its key, not the
+    # (already-deleted) temp file. The avatar stays "processing" (unusable
+    # for chat, see sessions.create_session) until both videos land, and
+    # flips to "failed" if LivePortrait isn't configured or generation
+    # errors out.
+    background_tasks.add_task(_generate_idle_thinking_videos, avatar_id, image_key)
 
     logger.info(f"Avatar created: {avatar_id} for user {_user_id(current_user)}")
     return avatar
@@ -295,6 +411,10 @@ async def delete_avatar(
     try:
         await storage_service.delete_file(avatar.s3_key)
         await storage_service.delete_file(avatar.s3_key.replace("image.jpg", "thumbnail.jpg"))
+        if avatar.idle_video_url:
+            await storage_service.delete_file(f"avatars/{avatar_id}/idle.mp4")
+        if avatar.thinking_video_url:
+            await storage_service.delete_file(f"avatars/{avatar_id}/thinking.mp4")
     except Exception as e:
         # Row is gone; leftover files are harmless and reaped by the cleanup task.
         logger.warning(f"Could not delete stored files for avatar {avatar_id}: {e}")

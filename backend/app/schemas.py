@@ -40,6 +40,8 @@ class AvatarResponse(AvatarBase):
     user_id: str
     image_url: str
     thumbnail_url: Optional[str] = None
+    idle_video_url: Optional[str] = None
+    thinking_video_url: Optional[str] = None
     status: str
     voice_id: Optional[str] = None
     avatar_metadata: Optional[Dict[str, Any]] = Field(None, alias="avatar_metadata")

@@ -1,39 +1,38 @@
 /** @type {import('next').NextConfig} */
 const nextConfig = {
   reactStrictMode: true,
+
+  // Allow access from local network/dev machines
+  allowedDevOrigins: [
+    'localhost',
+    '127.0.0.1',
+    '10.28.80.162',
+    '10.28.81.139',
+  ],
+
   images: {
     dangerouslyAllowSVG: true,
     unoptimized: process.env.NODE_ENV === 'development',
+
+    // Allow images from any source
     remotePatterns: [
       {
         protocol: 'http',
-        hostname: 'localhost',
+        hostname: '**',
       },
       {
         protocol: 'https',
-        hostname: '*.s3.*.amazonaws.com',
+        hostname: '**',
       },
-      {
-        protocol: 'https',
-        hostname: 's3.amazonaws.com',
-      },
-      ...(process.env.NEXT_PUBLIC_S3_BUCKET_DOMAIN
-        ? [{
-            protocol: 'https',
-            hostname: process.env.NEXT_PUBLIC_S3_BUCKET_DOMAIN,
-          }]
-        : []),
-      ...(process.env.NEXT_PUBLIC_CLOUDFRONT_DOMAIN
-        ? [{
-            protocol: 'https',
-            hostname: process.env.NEXT_PUBLIC_CLOUDFRONT_DOMAIN,
-          }]
-        : []),
     ],
   },
+
   env: {
-    NEXT_PUBLIC_API_URL: process.env.NEXT_PUBLIC_API_URL || 'http://localhost:8000',
-    NEXT_PUBLIC_WS_URL: process.env.NEXT_PUBLIC_WS_URL || 'ws://localhost:8000',
+    NEXT_PUBLIC_API_URL:
+      process.env.NEXT_PUBLIC_API_URL || 'http://localhost:8000',
+
+    NEXT_PUBLIC_WS_URL:
+      process.env.NEXT_PUBLIC_WS_URL || 'ws://localhost:8000',
   },
 };
 
