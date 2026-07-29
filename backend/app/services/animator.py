@@ -280,6 +280,71 @@ class AvatarAnimator:
 
             return output_path
 
+    # ── warmup ────────────────────────────────────────────────────────────────
+
+    async def warmup_models(self) -> None:
+        """
+        Load MuseTalk's model weights onto the GPU ahead of any session, so
+        the first real user of the process isn't the one paying the
+        60s-10min model-load cost. No avatar image is needed for this —
+        it's just spinning up the persistent worker and waiting for READY.
+        Safe to call at server startup; best-effort (logs and returns on
+        failure so a missing/broken MuseTalk checkout can't block startup).
+        """
+        if not self._initialised:
+            await self.initialize()
+        if self.engine != "musetalk":
+            return
+        try:
+            async with self._worker_lock:
+                await self._ensure_worker()
+        except Exception:
+            logger.exception("Model warmup failed — worker will load lazily on first real request")
+
+    async def _write_silence(self, path: Path, seconds: float) -> None:
+        proc = await asyncio.create_subprocess_exec(
+            "ffmpeg", "-y", "-v", "error",
+            "-f", "lavfi", "-i", "anullsrc=r=16000:cl=mono",
+            "-t", str(seconds),
+            "-acodec", "pcm_s16le",
+            str(path),
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+        _, stderr = await proc.communicate()
+        if proc.returncode != 0:
+            raise RuntimeError(f"Could not generate warmup silence: {stderr.decode(errors='replace')}")
+
+    async def warmup_avatar(self, avatar_image_path: str) -> None:
+        """
+        Run one throwaway inference for this specific avatar: loads the
+        worker if it isn't already up, computes/caches this avatar's face
+        landmarks + latents (the per-avatar cost musetalk_worker.py would
+        otherwise pay lazily on the first real turn), and warms the CUDA
+        kernels for this crop shape. Called from the WS connect path so a
+        session's first REAL message doesn't eat this latency.
+
+        Best-effort — swallows all errors so a broken/missing avatar image
+        can't block a session from ever starting; the real `animate()` call
+        already falls back to the simple ffmpeg engine on failure anyway.
+        """
+        if not self._initialised:
+            await self.initialize()
+        if self.engine != "musetalk":
+            return
+
+        dummy_audio = TMPDIR / f"warmup-{uuid.uuid4().hex}.wav"
+        dummy_output = TMPDIR / f"warmup-{uuid.uuid4().hex}.mp4"
+        try:
+            await self._write_silence(dummy_audio, seconds=1.0)
+            await self._animate_musetalk(avatar_image_path, str(dummy_audio), str(dummy_output))
+            logger.info(f"Avatar warmup complete: {avatar_image_path}")
+        except Exception:
+            logger.exception(f"Avatar warmup failed for {avatar_image_path} — continuing anyway")
+        finally:
+            dummy_audio.unlink(missing_ok=True)
+            dummy_output.unlink(missing_ok=True)
+
     # ── public API ────────────────────────────────────────────────────────────
 
     async def animate(

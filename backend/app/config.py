@@ -62,6 +62,10 @@ class Settings(BaseSettings):
     LLM_MODEL: str = "claude-sonnet-4-6"
     LLM_TEMPERATURE: float = 0.7
     LLM_MAX_TOKENS: int = 2000
+    # Number of recent user/assistant pairs to keep in the LLM context window.
+    # The raw message window is twice this value because it includes both the
+    # user and assistant side of each pair.
+    LLM_CONTEXT_PAIRS: int = 30
 
     # Avatar Engine
     AVATAR_ENGINE: str = "musetalk"  # musetalk, simple

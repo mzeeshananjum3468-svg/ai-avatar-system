@@ -45,6 +45,8 @@ export type WsMessageType =
   | 'pong'
   | 'tts_fallback'
   | 'interrupted'
+  | 'warmup_start'
+  | 'session_ready'
 
 // Discriminated union — each WS event has a well-typed payload so the handler
 // can rely on field presence without optional-chaining everywhere.
@@ -60,6 +62,14 @@ export type WsMessage =
   | { type: 'pong' }
   | { type: 'tts_fallback'; engine: string; voice_cloned: boolean; message: string }
   | { type: 'interrupted'; message: string }
+  // Sent once right after the WS connects, before the receive loop is even
+  // live server-side: the backend is running a one-off dummy MuseTalk job
+  // for this avatar (face-prep + CUDA warmup) so the first REAL turn isn't
+  // the one paying that latency. 'session_ready' follows once it's done —
+  // the client can't get a reply to anything sent before that anyway, since
+  // the backend hasn't started reading from the socket yet.
+  | { type: 'warmup_start'; message: string }
+  | { type: 'session_ready' }
 
 export interface VoiceApiResponse {
   id: string

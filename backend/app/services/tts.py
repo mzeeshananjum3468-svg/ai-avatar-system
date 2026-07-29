@@ -72,7 +72,106 @@ _EDGE_VOICES = {
 # Treat them as chatterbox instead of breaking every synthesis call.
 _LEGACY_PROVIDER_ALIASES = {"coqui": "chatterbox", "xtts": "chatterbox", "xtts_v2": "chatterbox"}
 
-import torch
+_alignment_analyzer_patched = False
+
+
+def _patch_alignment_analyzer() -> None:
+    """
+    Monkeypatch chatterbox-tts's AlignmentStreamAnalyzer.step to fix an
+    over-eager repetition heuristic that was truncating audio mid-sentence.
+
+    The installed package (chatterbox-tts==0.1.4) flags "token_repetition"
+    the instant the last TWO generated tokens are equal (its own comment
+    claims "3x same token in a row" but the slice is `[-2:]`), and does so
+    at ANY point in generation — the `self.complete and` guard that would
+    restrict it to the tail is commented out in the upstream source. Two
+    identical consecutive tokens happen constantly in normal speech (held
+    vowels, plosives, natural pauses), so this forced an early EOS on
+    almost every real synthesis call, silently handing back audio that
+    covers only the first few words of the requested text. `generate()`
+    never raises in this case, so nothing downstream (chunking, retries)
+    can detect the truncation — it just plays back short.
+
+    Patched to require 3 consecutive identical tokens (matching what the
+    upstream comment already claims to do) AND to only fire once the
+    utterance is otherwise complete — so it still trims a genuine
+    hallucinated trailing repeat, but can no longer cut off a normal
+    mid-utterance sound.
+    """
+    global _alignment_analyzer_patched
+    if _alignment_analyzer_patched:
+        return
+
+    from chatterbox.models.t3.inference.alignment_stream_analyzer import (
+        AlignmentStreamAnalyzer,
+    )
+
+    def _patched_step(self, logits, next_token=None):
+        aligned_attn = torch.stack(self.last_aligned_attns).mean(dim=0)
+        i, j = self.text_tokens_slice
+        if self.curr_frame_pos == 0:
+            A_chunk = aligned_attn[j:, i:j].clone().cpu()
+        else:
+            A_chunk = aligned_attn[:, i:j].clone().cpu()
+        A_chunk[:, self.curr_frame_pos + 1:] = 0
+
+        self.alignment = torch.cat((self.alignment, A_chunk), dim=0)
+        A = self.alignment
+        T, S = A.shape
+
+        cur_text_posn = A_chunk[-1].argmax()
+        discontinuity = not (-4 < cur_text_posn - self.text_position < 7)
+        if not discontinuity:
+            self.text_position = cur_text_posn
+
+        false_start = (not self.started) and (A[-2:, -2:].max() > 0.1 or A[:, :4].max() < 0.5)
+        self.started = not false_start
+        if self.started and self.started_at is None:
+            self.started_at = T
+
+        self.complete = self.complete or self.text_position >= S - 3
+        if self.complete and self.completed_at is None:
+            self.completed_at = T
+
+        long_tail = self.complete and (A[self.completed_at:, -3:].sum(dim=0).max() >= 5)
+        alignment_repetition = self.complete and (A[self.completed_at:, :-5].max(dim=1).values.sum() > 5)
+
+        if next_token is not None:
+            token_id = (
+                next_token.item() if isinstance(next_token, torch.Tensor) and next_token.numel() == 1
+                else next_token.view(-1)[0].item() if isinstance(next_token, torch.Tensor)
+                else next_token
+            )
+            self.generated_tokens.append(token_id)
+            if len(self.generated_tokens) > 8:
+                self.generated_tokens = self.generated_tokens[-8:]
+
+        # PATCHED (see _patch_alignment_analyzer docstring): 3-in-a-row, and
+        # only once the utterance is otherwise complete.
+        token_repetition = (
+            self.complete
+            and len(self.generated_tokens) >= 3
+            and len(set(self.generated_tokens[-3:])) == 1
+        )
+
+        if token_repetition:
+            logger.warning(f"🚨 Detected 3x repetition of token {self.generated_tokens[-1]}")
+
+        if cur_text_posn < S - 3 and S > 5:
+            logits[..., self.eos_idx] = -2**15
+
+        if long_tail or alignment_repetition or token_repetition:
+            logger.warning(f"forcing EOS token, {long_tail=}, {alignment_repetition=}, {token_repetition=}")
+            logits = -(2**15) * torch.ones_like(logits)
+            logits[..., self.eos_idx] = 2**15
+
+        self.curr_frame_pos += 1
+        return logits
+
+    AlignmentStreamAnalyzer.step = _patched_step
+    _alignment_analyzer_patched = True
+    logger.info("Patched chatterbox AlignmentStreamAnalyzer.step (fixed over-eager repetition EOS forcing)")
+
 
 def clean_audio(wav):
     # Remove channel dimension if needed
@@ -198,6 +297,8 @@ class TTSService:
         try:
             from chatterbox.mtl_tts import ChatterboxMultilingualTTS
 
+            _patch_alignment_analyzer()
+
             device = "cuda" if self._check_cuda() else "cpu"
             logger.info(f"Loading Chatterbox multilingual TTS on {device}...")
             # logger.info("Zeeshan: Forcing an exception to test fallback")
@@ -210,6 +311,47 @@ class TTSService:
         except Exception :
             logger.exception("Failed to load Chatterbox")
             raise
+
+    async def warmup_model(self) -> None:
+        """
+        Load Chatterbox's weights ahead of any session, mirroring
+        AvatarAnimator.warmup_models() — best-effort so a broken/missing
+        Chatterbox install can't block server startup; synthesize() already
+        falls back to edge-tts/gTTS if the model never loads.
+        """
+        try:
+            await self.initialize()
+        except Exception:
+            logger.exception("TTS model warmup failed — will load lazily on first real request")
+
+    async def warmup(self, speaker_wav: Optional[str] = None, language: str = "en") -> None:
+        """
+        Run one throwaway synthesis so CUDA kernels — and, if a voice is
+        given, THIS session's specific voice-cloning conditioning path — are
+        warm before the first real turn. Called alongside
+        AvatarAnimator.warmup_avatar() from the WS connect path so a fresh
+        session's first real sentence isn't the one paying for it.
+
+        Best-effort — swallows all errors so a broken speaker WAV or a
+        cold-start failure here can't block the session from starting; the
+        real synthesize() call already has its own fallback chain.
+        """
+        import tempfile
+
+        tmp = tempfile.NamedTemporaryFile(suffix=".wav", delete=False)
+        tmp.close()
+        try:
+            await self.synthesize(
+                text="Warming up.",
+                output_path=tmp.name,
+                speaker_wav=speaker_wav,
+                language=language,
+            )
+            logger.info("TTS warmup complete" + (f" (voice={speaker_wav})" if speaker_wav else ""))
+        except Exception:
+            logger.exception("TTS avatar warmup failed — continuing anyway")
+        finally:
+            Path(tmp.name).unlink(missing_ok=True)
 
     async def synthesize(
         self,

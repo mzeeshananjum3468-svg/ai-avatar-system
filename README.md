@@ -419,6 +419,7 @@ Key `.env` variables:
 # LLM
 LLM_PROVIDER=anthropic            # anthropic | openai | ollama (local & free)
 LLM_MODEL=claude-sonnet-4-6       # or gpt-4o · llama3.1 · qwen2.5 …
+LLM_CONTEXT_PAIRS=30              # recent user/assistant pairs to retain in LLM context
 ANTHROPIC_API_KEY=sk-ant-...
 OPENAI_BASE_URL=                  # e.g. http://localhost:11434/v1 for Ollama / vLLM / LM Studio
 

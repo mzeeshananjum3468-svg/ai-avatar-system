@@ -1,3 +1,4 @@
+import asyncio
 import logging
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
@@ -20,8 +21,10 @@ from app.middleware.rate_limiter import RateLimitMiddleware
 from app.middleware.security import RequestLoggingMiddleware, SecurityHeadersMiddleware
 from app.models import Session as SessionModel
 from app.models import User
+from app.services.animator import avatar_animator
 from app.services.cache import cache_service
 from app.services.storage import storage_service
+from app.services.tts import tts_service
 from app.telemetry import init_telemetry
 from app.websocket import websocket_manager
 
@@ -108,6 +111,24 @@ async def lifespan(app: FastAPI):
         logger.info(f"Serving local uploads from {uploads_dir}")
 
     websocket_manager.start_cleanup_task()
+
+    # Kick off MuseTalk model loading in the background so the GPU weights
+    # are already resident by the time the first WS session connects,
+    # instead of the first user's session paying the 60s-10min load cost.
+    # Fire-and-forget: startup must not block on this (no avatar is known
+    # yet at this point anyway — avatar-specific warmup happens per-session
+    # in websocket.connect()).
+    # Keep a reference on app.state — asyncio only holds a weak ref to a
+    # task once nothing else does, so an unreferenced fire-and-forget task
+    # can be garbage-collected mid-run.
+    app.state.model_warmup_task = asyncio.create_task(
+        avatar_animator.warmup_models(), name="musetalk-model-warmup"
+    )
+    # Same idea for Chatterbox — load its weights ahead of any session too.
+    app.state.tts_warmup_task = asyncio.create_task(
+        tts_service.warmup_model(), name="chatterbox-model-warmup"
+    )
+
     logger.info("AI Avatar System started successfully")
 
     yield

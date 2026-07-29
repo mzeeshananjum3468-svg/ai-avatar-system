@@ -16,6 +16,7 @@ from fastapi import WebSocket
 from app.services.animator import avatar_animator
 from app.services.llm import llm_service
 from app.services.storage import storage_service
+from app.config import settings
 from app.services.stt import stt_service
 from app.services.tts import tts_service
 from app.telemetry import span
@@ -128,7 +129,7 @@ MAX_TEXT_INPUT_LEN = 4000
 
 # Conversation memory cap — keep the most recent N user/assistant pairs.
 # System prompt is stored separately so it survives trimming.
-MAX_CONTEXT_MESSAGES = 60
+MAX_CONTEXT_MESSAGES = settings.LLM_CONTEXT_PAIRS * 2
 
 # Soft TTL for an idle (disconnected/abandoned) session in seconds.
 STALE_SESSION_TTL_SECS = 60 * 60 * 2  # 2 hours
@@ -172,6 +173,37 @@ class ConnectionManager:
             "last_activity": datetime.now(timezone.utc),
         }
         await self._load_session_data(session_id)
+
+        # Hard-gate the conversation on avatar + voice warmup: the caller (the
+        # WS endpoint in main.py) doesn't start its receive loop until this
+        # coroutine returns, so a fresh session can't send its first real
+        # message until both MuseTalk (this avatar's face-prep/CUDA warmup)
+        # and Chatterbox (this voice's cloning-conditioning/CUDA warmup) have
+        # already run once — otherwise the first user turn would silently
+        # eat that latency instead of a pair of dummy warmup jobs. Run them
+        # concurrently since they're independent GPU workloads (mirrors how
+        # the real turn also runs TTS then MuseTalk, just not serialized here
+        # since neither depends on the other's *output* during warmup).
+        #
+        # Always send both events, even when there's no avatar yet — the
+        # frontend flips to "warming up" optimistically as soon as the socket
+        # opens (before it can know whether this session has an avatar), so
+        # it needs a matching 'session_ready' no matter what or it gets
+        # stuck gated forever.
+        await self.send_message(
+            session_id,
+            {"type": "warmup_start", "message": "Warming up avatar…"},
+        )
+        avatar_image = self.session_data[session_id].get("avatar_image_local")
+        if avatar_image:
+            voice_wav = self.session_data[session_id].get("voice_wav")
+            language = self.session_data[session_id].get("language", "en")
+            await asyncio.gather(
+                avatar_animator.warmup_avatar(avatar_image),
+                tts_service.warmup(voice_wav, language),
+            )
+        await self.send_message(session_id, {"type": "session_ready"})
+
         logger.info(f"WebSocket connected: {session_id} (user={user_id})")
 
     async def _load_session_data(self, session_id: str):

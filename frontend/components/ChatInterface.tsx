@@ -190,6 +190,13 @@ export function ChatInterface({ avatarId, voiceId, resumeSessionId, onSessionCre
   const [statusMsg, setStatusMsg] = useState('Almost ready…')
   const [isTyping, setIsTyping] = useState(false)
   const [connectionStatus, setConnectionStatus] = useState<'connecting' | 'connected' | 'disconnected'>('connecting')
+  // True between 'warmup_start' and 'session_ready' — the backend is running
+  // a dummy MuseTalk job for this avatar before it even starts reading the
+  // socket, so anything sent during this window would just sit unanswered.
+  // Kept separate from isProcessing/isResponding: those track an in-flight
+  // turn and are wired to the video-chunk lifecycle (maybeFinishResponding),
+  // which never fires here since no real turn happens during warmup.
+  const [isWarmingUp, setIsWarmingUp] = useState(false)
   const [recordingLevel, setRecordingLevel] = useState(0)
   const [avatarImageUrl, setAvatarImageUrl] = useState<string | null>(null)
   // Streaming token accumulator — shown as a live bubble while LLM is generating
@@ -230,8 +237,17 @@ export function ChatInterface({ avatarId, voiceId, resumeSessionId, onSessionCre
   const [thinkingVideoUrl, setThinkingVideoUrl] = useState<string | null>(null)
 
   // ── Dual video buffer (seamless swap, no black frame) ──────────────────
-  // Two stacked <video> elements. The next source is always loaded into the
-  // offscreen one and only cross-faded into view once it can actually play.
+  // Two stacked <video> elements, used EXCLUSIVELY for cross-fading between
+  // successive reply chunks. The idle/thinking loop lives on its own,
+  // entirely separate `videoIdleRef` element below — it used to share this
+  // pair with chunk playback, and the two systems (independently triggered:
+  // WS events vs. native video 'ended'/'canplay' events) would race to grab
+  // the same "standby" slot, sometimes stomping an in-flight chunk load with
+  // an idle-loop transition (or vice versa) and leaving a chunk stuck
+  // mid-load forever. Giving idle its own element removes that shared
+  // resource entirely — there is no longer any DOM node the two systems can
+  // fight over.
+  const videoIdleRef = useRef<HTMLVideoElement>(null)
   const videoARef = useRef<HTMLVideoElement>(null)
   const videoBRef = useRef<HTMLVideoElement>(null)
   const activeIdxRef = useRef(0)
@@ -253,6 +269,16 @@ export function ChatInterface({ avatarId, voiceId, resumeSessionId, onSessionCre
   const idleUrlRef = useRef<string | null>(null)
   const thinkingUrlRef = useRef<string | null>(null)
   const isMutedRef = useRef(false)
+
+  // ── Text/animation sync ──────────────────────────────────────────────────
+  // LLM tokens normally arrive well before TTS+MuseTalk produce the first
+  // playable chunk. To make the text bubble appear in sync with the avatar
+  // actually talking (instead of racing ahead of it), tokens are buffered
+  // silently here and only flushed into the visible `streamingContent` once
+  // the first chunk of THIS turn starts really playing (see openGate()).
+  const pendingTextRef = useRef('')                 // all tokens accumulated so far this turn
+  const finalMessageRef = useRef<string | null>(null) // full text once the LLM is done, held if animation hasn't started
+  const firstChunkPlayedRef = useRef(false)         // true once this turn's first chunk has actually started playing
 
   // Pendulum (ping-pong) reverse playback for idle/thinking loops.
   const pendulumElRef = useRef<HTMLVideoElement | null>(null)
@@ -359,39 +385,46 @@ export function ChatInterface({ avatarId, voiceId, resumeSessionId, onSessionCre
     pendulumRafRef.current = requestAnimationFrame(pendulumStep)
   }
 
+  // Cross-fades between successive REPLY CHUNKS only — the idle/thinking
+  // loop has its own dedicated element (videoIdleRef, see playLoop()) and
+  // never goes through here, so this never has to coordinate with it.
   function transitionTo(src: string, mode: string, opts: {
-    loop?: boolean; muted?: boolean; isChunk?: boolean; pendulum?: boolean; objectUrl?: string | null; onCommit?: () => void
+    muted?: boolean; objectUrl?: string | null; onCommit?: () => void
   } = {}) {
-    const { loop = false, muted = true, isChunk = false, pendulum = false, objectUrl = null, onCommit } = opts
+    const { muted = true, objectUrl = null, onCommit } = opts
     const active = activeVideoEl()
     const standby = standbyVideoEl()
     if (!active || !standby) return
     const myToken = ++swapTokenRef.current
-    if (isChunk) pendingChunkTransitionRef.current = true
+    pendingChunkTransitionRef.current = true
 
     const commit = () => {
       if (myToken !== swapTokenRef.current) return // superseded (e.g. barge-in)
-      if (isChunk) pendingChunkTransitionRef.current = false
+      pendingChunkTransitionRef.current = false
       const outgoing = activeVideoEl()!
-      if (outgoing === pendulumElRef.current) stopPendulum()
       activeIdxRef.current = 1 - activeIdxRef.current
       setActiveIdx(activeIdxRef.current)
       const incoming = activeVideoEl()!
-      if (pendulum) startPendulum(incoming); else incoming.play().catch(() => {})
+      incoming.play().catch(() => {})
       outgoing.pause()
       if (outgoing.dataset.objectUrl) {
         URL.revokeObjectURL(outgoing.dataset.objectUrl)
         delete outgoing.dataset.objectUrl
       }
       onCommit?.()
+      // Fires React state updates (setMessages/setStreamingContent). Must run
+      // LAST, after every DOM/ref mutation above (including onCommit's
+      // prebufferNext) — this whole swap has to fully land first so a
+      // re-render triggered here can never land mid-swap.
+      openGate() // this chunk is actually playing now — reveal text if this is the turn's first
     }
 
     if (active.dataset.mode === mode && active.src === src) {
-      if (isChunk) pendingChunkTransitionRef.current = false
+      pendingChunkTransitionRef.current = false
       return
     }
 
-    standby.loop = loop
+    standby.loop = false
     standby.muted = muted
     standby.dataset.mode = mode
     if (objectUrl) standby.dataset.objectUrl = objectUrl; else delete standby.dataset.objectUrl
@@ -399,7 +432,20 @@ export function ChatInterface({ avatarId, voiceId, resumeSessionId, onSessionCre
     if (standby.src === src && standby.readyState >= 3) { commit(); return }
 
     const onReady = () => { cleanup(); commit() }
-    const onError = () => { cleanup(); if (isChunk) pendingChunkTransitionRef.current = false }
+    // A genuinely broken chunk (bad encode, truncated blob) must not leave
+    // the pipeline stuck: isPlayingChunkRef was already set true by the
+    // caller (playChunk) before this transition started, and nothing else
+    // is going to fire an 'ended' event for a video that never started
+    // playing. Without advancing here, this chunk would hang forever with
+    // isSpeaking stuck on and every later chunk stuck behind it in the queue.
+    const onError = () => {
+      cleanup()
+      pendingChunkTransitionRef.current = false
+      if (myToken !== swapTokenRef.current) return // superseded (e.g. barge-in)
+      isPlayingChunkRef.current = false
+      setIsSpeaking(false)
+      tryPlayNext()
+    }
     function cleanup() {
       standby!.removeEventListener('canplay', onReady)
       standby!.removeEventListener('error', onError)
@@ -416,18 +462,30 @@ export function ChatInterface({ avatarId, voiceId, resumeSessionId, onSessionCre
     return { src: idleUrlRef.current, mode: 'idle' }
   }
 
+  // Manages ONLY the dedicated idle/thinking element — entirely independent
+  // of the chunk-pair cross-fade in transitionTo(). Always safe to call:
+  // there's no shared standby slot here for a chunk transition to race.
   function playLoop() {
     const { src, mode } = currentLoop()
     setLoopMode(mode)
-    if (!src) return // nothing generated yet for this avatar — placeholder stays up
-    const active = activeVideoEl()
-    if (!active) return
-    if (active.src === src) {
-      active.dataset.mode = mode
-      resumePendulumOrPlay(active)
+    setIsSpeaking(false) // hide the chunk pair, idle element becomes visible
+    const idleEl = videoIdleRef.current
+    if (!idleEl || !src) return // nothing generated yet for this avatar — placeholder stays up
+    if (idleEl.src === src) {
+      idleEl.dataset.mode = mode
+      resumePendulumOrPlay(idleEl)
       return
     }
-    transitionTo(src, mode, { loop: false, muted: true, pendulum: true })
+    idleEl.loop = false
+    idleEl.muted = true
+    idleEl.dataset.mode = mode
+    const onReady = () => {
+      idleEl.removeEventListener('canplay', onReady)
+      startPendulum(idleEl)
+    }
+    idleEl.addEventListener('canplay', onReady, { once: true })
+    idleEl.src = src
+    idleEl.load()
   }
 
   // While a chunk is playing, silently load the next queued chunk into the
@@ -458,7 +516,6 @@ export function ChatInterface({ avatarId, voiceId, resumeSessionId, onSessionCre
     setIsSpeaking(true)
     swapTokenRef.current++ // invalidate any stray in-flight transitionTo commit
     const outgoing = activeVideoEl()!
-    if (outgoing === pendulumElRef.current) stopPendulum()
     activeIdxRef.current = 1 - activeIdxRef.current
     setActiveIdx(activeIdxRef.current)
     const incoming = activeVideoEl()!
@@ -469,13 +526,16 @@ export function ChatInterface({ avatarId, voiceId, resumeSessionId, onSessionCre
       delete outgoing.dataset.objectUrl
     }
     prebufferNext()
+    // Fires React state updates — must run LAST, after prebufferNext(),
+    // same reasoning as the call at the end of transitionTo's commit().
+    openGate() // this chunk is actually playing now — reveal text if this is the turn's first
   }
 
   function playChunk(item: VideoChunk) {
     isPlayingChunkRef.current = true
     setIsSpeaking(true)
     transitionTo(item.url, 'chunk:' + item.index, {
-      loop: false, muted: isMutedRef.current, isChunk: true, objectUrl: item.url,
+      muted: isMutedRef.current, objectUrl: item.url,
       onCommit: () => prebufferNext(),
     })
   }
@@ -513,11 +573,57 @@ export function ChatInterface({ avatarId, voiceId, resumeSessionId, onSessionCre
       .finally(() => { downloadingRef.current = false; pumpDownloads() })
   }
 
+  // Push the fully-assembled assistant reply into the transcript as a real
+  // (persisted-looking) message bubble, replacing the streaming preview.
+  // Deliberately does NOT touch video playback/loop state — this can fire at
+  // an arbitrary time relative to the chunk pipeline (either from inside a
+  // chunk's swap commit, or directly off the 'message' WS event whenever the
+  // gate's already open), so it must stay a pure text-transcript update.
+  // Resuming the idle/thinking loop when nothing's playing is already fully
+  // owned by video_chunk_end's handler and tryPlayNext()'s empty-queue
+  // branch — duplicating that call here only risked an extra transitionTo()
+  // firing at an unpredictable moment in the chunk-to-chunk handoff.
+  function commitFinalMessage(content: string) {
+    setStreamingContent('')
+    setIsTyping(false)
+    setMessages(prev => [...prev, {
+      id: Date.now().toString(),
+      role: 'assistant',
+      content,
+      timestamp: new Date(),
+      emotion: detectEmotion(content),
+    }])
+    finalMessageRef.current = null
+  }
+
+  // Flips the text bubble on. Called the moment this turn's first video
+  // chunk actually starts playing (see the `openGate()` call sites in
+  // commitPrebuffered/transitionTo's commit()) — idempotent, so later
+  // chunks calling it again are no-ops. If the LLM already finished before
+  // any chunk played (the common case — TTS+animation lag behind token
+  // generation), the full final message was sitting in finalMessageRef;
+  // otherwise reveal whatever's buffered so far and let 'token' take it
+  // from there in real time.
+  function openGate() {
+    if (firstChunkPlayedRef.current) return
+    firstChunkPlayedRef.current = true
+    if (finalMessageRef.current !== null) {
+      commitFinalMessage(finalMessageRef.current)
+    } else {
+      setIsTyping(false)
+      setStreamingContent(pendingTextRef.current)
+    }
+  }
+
   // Only actually leave "responding" once the server says the turn is over
   // AND the local pipeline has caught up — otherwise a chunk still in flight
   // would get skipped over and drop straight to idle before it plays.
   function maybeFinishResponding() {
     if (streamEndedRef.current && pipelineDrained() && isRespondingRef.current) {
+      // Safety net: every chunk failed to animate (see the "Avatar animation
+      // failed for all sentences" error path), so the gate would otherwise
+      // never open and the whole reply would stay buffered forever.
+      if (!firstChunkPlayedRef.current) openGate()
       isRespondingRef.current = false
       setIsProcessing(false)
     }
@@ -525,7 +631,20 @@ export function ChatInterface({ avatarId, voiceId, resumeSessionId, onSessionCre
 
   function tryPlayNext() {
     if (isPlayingChunkRef.current) return
-    if (playQueueRef.current.length === 0) { maybeFinishResponding(); playLoop(); return }
+    if (playQueueRef.current.length === 0) {
+      maybeFinishResponding()
+      // Only actually drop to the idle/thinking loop if nothing is coming
+      // "soon" either — a chunk already announced via 'video_chunk' but
+      // still mid-download is a matter of one network round-trip, not a
+      // real gap. Flipping to idle here raced the download: the loop's own
+      // transitionTo would grab the standby element right as the chunk's
+      // own transitionTo needed it, so the swap that actually mattered kept
+      // getting superseded before it could commit — the video would sit on
+      // idle/thinking far longer than the real gap, reading as "stalled"
+      // even though every chunk was still arriving underneath it.
+      if (downloadQueueRef.current.length === 0 && !downloadingRef.current) playLoop()
+      return
+    }
     const item = playQueueRef.current.shift()!
     if (prebufferedItemRef.current === item) {
       prebufferedItemRef.current = null
@@ -547,6 +666,11 @@ export function ChatInterface({ avatarId, voiceId, resumeSessionId, onSessionCre
     isPlayingChunkRef.current = false
     setIsSpeaking(false)
     stopPendulum()
+    // The turn this buffered/held text belonged to is being torn down —
+    // don't let it leak into whatever turn starts next.
+    pendingTextRef.current = ''
+    finalMessageRef.current = null
+    firstChunkPlayedRef.current = false
     ;[videoARef.current, videoBRef.current].forEach((v) => {
       if (!v) return
       v.pause()
@@ -569,41 +693,57 @@ export function ChatInterface({ avatarId, voiceId, resumeSessionId, onSessionCre
   // Attach ended/error handlers once on mount. These only ever touch refs
   // and stable setState identities, so a stale render closure is harmless —
   // functionally identical to test_client.html's one-shot IIFE wiring.
+  // Split in two: the A/B pair only ever hosts reply chunks now (mode is
+  // always 'chunk:N'), and the idle/thinking loop's pendulum-reverse-at-end
+  // logic lives entirely on its own dedicated element.
   useEffect(() => {
-    const onEndedFactory = (el: HTMLVideoElement | null) => () => {
+    const onChunkEndedFactory = (el: HTMLVideoElement | null) => () => {
       if (!el || el !== activeVideoEl()) return
-      const mode = el.dataset.mode || ''
-      if (mode.startsWith('chunk:')) {
-        isPlayingChunkRef.current = false
-        setIsSpeaking(false)
-        tryPlayNext()
-      } else if (el === pendulumElRef.current && !pendulumReversingRef.current) {
-        beginPendulumReverse(el)
-      }
+      isPlayingChunkRef.current = false
+      setIsSpeaking(false)
+      tryPlayNext()
     }
-    const onErrorFactory = (el: HTMLVideoElement | null) => () => {
-      const mode = el?.dataset.mode || ''
-      if (mode.startsWith('chunk:')) {
-        isPlayingChunkRef.current = false
-        setIsSpeaking(false)
-        tryPlayNext()
+    // Scoped exactly like onChunkEndedFactory — an 'error' firing on the
+    // STANDBY element (e.g. a transient decode hiccup while prebufferNext()
+    // silently preloads the next chunk in the background) must NOT be able
+    // to kill isPlayingChunkRef/tryPlayNext() while the ACTIVE element is
+    // still genuinely mid-playback. A single shared, unscoped handler here
+    // used to do exactly that: it fired for whichever element errored,
+    // active or standby, incorrectly telling the pipeline the current chunk
+    // had ended. That desynced isPlayingChunkRef from what was actually on
+    // screen, and the next tryPlayNext()/transitionTo() would then grab the
+    // very element that just errored — the reply would silently stop
+    // advancing after the first chunk with no further "ended" ever firing.
+    const onChunkErrorFactory = (el: HTMLVideoElement | null) => () => {
+      if (!el || el !== activeVideoEl()) return
+      isPlayingChunkRef.current = false
+      setIsSpeaking(false)
+      tryPlayNext()
+    }
+    const onIdleEnded = () => {
+      const el = videoIdleRef.current
+      if (el && el === pendulumElRef.current && !pendulumReversingRef.current) {
+        beginPendulumReverse(el)
       }
     }
     const a = videoARef.current
     const b = videoBRef.current
-    const onEndedA = onEndedFactory(a)
-    const onEndedB = onEndedFactory(b)
-    const onErrorA = onErrorFactory(a)
-    const onErrorB = onErrorFactory(b)
+    const idleEl = videoIdleRef.current
+    const onEndedA = onChunkEndedFactory(a)
+    const onEndedB = onChunkEndedFactory(b)
+    const onErrorA = onChunkErrorFactory(a)
+    const onErrorB = onChunkErrorFactory(b)
     a?.addEventListener('ended', onEndedA)
     a?.addEventListener('error', onErrorA)
     b?.addEventListener('ended', onEndedB)
     b?.addEventListener('error', onErrorB)
+    idleEl?.addEventListener('ended', onIdleEnded)
     return () => {
       a?.removeEventListener('ended', onEndedA)
       a?.removeEventListener('error', onErrorA)
       b?.removeEventListener('ended', onEndedB)
       b?.removeEventListener('error', onErrorB)
+      idleEl?.removeEventListener('ended', onIdleEnded)
     }
   // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [])
@@ -690,6 +830,11 @@ export function ChatInterface({ avatarId, voiceId, resumeSessionId, onSessionCre
       setReconnectStalled(false)
       setConnectionStatus('connected')
       setWsConnected(true)
+      // Assume gated until 'session_ready' arrives — the backend may not
+      // even be reading from the socket yet if it's mid-warmup, so gate
+      // from the earliest possible moment rather than waiting for the
+      // 'warmup_start' message to close the race.
+      setIsWarmingUp(true)
       if (wasFreshConnect) {
         toast.success('Connected to avatar!', { icon: '✨' })
       }
@@ -704,10 +849,12 @@ export function ChatInterface({ avatarId, voiceId, resumeSessionId, onSessionCre
     websocket.onerror = () => {
       setConnectionStatus('disconnected')
       setWsConnected(false)
+      setIsWarmingUp(false)
     }
     websocket.onclose = (event) => {
       setConnectionStatus('disconnected')
       setWsConnected(false)
+      setIsWarmingUp(false)
 
       // 4401 = backend rejected the handshake (no token, bad token, or not the
       // session owner). No point reconnecting — surface a clear error instead.
@@ -736,10 +883,15 @@ export function ChatInterface({ avatarId, voiceId, resumeSessionId, onSessionCre
 
   const handleWebSocketMessage = useCallback((data: WsMessage) => {
     switch (data.type) {
-      // Live token stream — accumulate into a streaming bubble
+      // Live token stream. Buffered silently until this turn's first video
+      // chunk actually starts playing (openGate()) — otherwise the text
+      // races ahead of TTS+animation, which lag well behind token generation.
       case 'token':
-        setStreamingContent(prev => prev + data.token)
-        setIsTyping(false)
+        pendingTextRef.current += data.token
+        if (firstChunkPlayedRef.current) {
+          setStreamingContent(prev => prev + data.token)
+          setIsTyping(false)
+        }
         break
 
       case 'transcription': {
@@ -753,23 +905,23 @@ export function ChatInterface({ avatarId, voiceId, resumeSessionId, onSessionCre
         }])
         setStreamingContent('')
         setIsTyping(true)
+        // Fresh turn starting — clear any leftover buffer/gate state.
+        pendingTextRef.current = ''
+        finalMessageRef.current = null
+        firstChunkPlayedRef.current = false
         break
       }
 
       case 'message': {
-        const content = data.content
-        setStreamingContent('')
-        setIsTyping(false)
-        setMessages(prev => [...prev, {
-          id: Date.now().toString(),
-          role: 'assistant',
-          content,
-          timestamp: new Date(),
-          emotion: detectEmotion(content),
-        }])
-        // isResponding stays true — the thinking/chunk pipeline (not this
-        // text event) decides when the turn is actually over.
-        if (!isPlayingChunkRef.current) playLoop()
+        if (firstChunkPlayedRef.current) {
+          // Gate's already open (a chunk is already playing) — show it now.
+          commitFinalMessage(data.content)
+        } else {
+          // Common case: the LLM finished well before TTS+animation produced
+          // a playable chunk. Hold the final text — openGate() fires it the
+          // moment the avatar actually starts talking instead of now.
+          finalMessageRef.current = data.content
+        }
         break
       }
 
@@ -788,9 +940,12 @@ export function ChatInterface({ avatarId, voiceId, resumeSessionId, onSessionCre
 
       case 'video_chunk_end':
         streamEndedRef.current = true
-        // Only actually drops to idle once every chunk has been fetched and played.
+        // Only actually drops to idle once every chunk has been fetched and
+        // played — the server can send this the instant it's queued the
+        // last sentence, well before that chunk's video finishes downloading
+        // on our end. Same guard as tryPlayNext()'s empty branch.
         maybeFinishResponding()
-        if (!isPlayingChunkRef.current) playLoop()
+        if (!isPlayingChunkRef.current && downloadQueueRef.current.length === 0 && !downloadingRef.current) playLoop()
         break
 
       case 'status':
@@ -806,6 +961,9 @@ export function ChatInterface({ avatarId, voiceId, resumeSessionId, onSessionCre
         isRespondingRef.current = false
         setIsProcessing(false)
         setIsTyping(false)
+        pendingTextRef.current = ''
+        finalMessageRef.current = null
+        firstChunkPlayedRef.current = false
         if (!isPlayingChunkRef.current) playLoop()
         break
 
@@ -827,6 +985,14 @@ export function ChatInterface({ avatarId, voiceId, resumeSessionId, onSessionCre
         break
 
       case 'pong':
+        break
+
+      case 'warmup_start':
+        setIsWarmingUp(true)
+        break
+
+      case 'session_ready':
+        setIsWarmingUp(false)
         break
     }
   // eslint-disable-next-line react-hooks/exhaustive-deps
@@ -861,6 +1027,9 @@ export function ChatInterface({ avatarId, voiceId, resumeSessionId, onSessionCre
     sendTimeRef.current = Date.now()
     isRespondingRef.current = true
     streamEndedRef.current = false
+    pendingTextRef.current = ''
+    finalMessageRef.current = null
+    firstChunkPlayedRef.current = false
     playLoop()
   }
 
@@ -1076,7 +1245,8 @@ export function ChatInterface({ avatarId, voiceId, resumeSessionId, onSessionCre
       // and running rAF loops (playback + pendulum) all survive unmount otherwise.
       const videoA = videoARef.current
       const videoB = videoBRef.current
-      ;[videoA, videoB].forEach((video) => {
+      const videoIdle = videoIdleRef.current
+      ;[videoA, videoB, videoIdle].forEach((video) => {
         if (!video) return
         video.pause()
         if (video.dataset.objectUrl) URL.revokeObjectURL(video.dataset.objectUrl)
@@ -1126,8 +1296,8 @@ export function ChatInterface({ avatarId, voiceId, resumeSessionId, onSessionCre
               <IdleAvatar imageUrl={avatarImageUrl} />
             </div>
 
-            {/* ── Dual video buffer: idle/thinking loops + reply chunks cross-fade
-                 between these two elements with no black frame in between ── */}
+            {/* ── Idle/thinking loop — its own dedicated element, never shared
+                 with reply-chunk playback. Visible whenever a chunk isn't. ── */}
             {/* `muted` is intentionally NOT a controlled prop here — it's driven
                 imperatively by the playback engine (loops always muted, chunks
                 follow isMuted) via refs. Binding it through JSX would make React
@@ -1136,20 +1306,39 @@ export function ChatInterface({ avatarId, voiceId, resumeSessionId, onSessionCre
                 the full frame is always visible, letterboxed instead of cropped,
                 so a full-body avatar never loses its head/feet. */}
             <video
+              ref={videoIdleRef}
+              className="absolute inset-0 w-full h-full object-contain transition-opacity duration-100"
+              style={{ opacity: !showPlaceholder && !isSpeaking ? 1 : 0, zIndex: !isSpeaking ? 5 : 4 }}
+              playsInline
+            />
+
+            {/* ── Reply-chunk pair: cross-fades between successive chunks only,
+                 completely separate from the idle/thinking element above ── */}
+            <video
               ref={videoARef}
               className="absolute inset-0 w-full h-full object-contain transition-opacity duration-100"
-              style={{ opacity: !showPlaceholder && activeIdx === 0 ? 1 : 0, zIndex: activeIdx === 0 ? 5 : 4 }}
+              style={{ opacity: !showPlaceholder && isSpeaking && activeIdx === 0 ? 1 : 0, zIndex: isSpeaking && activeIdx === 0 ? 6 : 3 }}
               playsInline
             />
             <video
               ref={videoBRef}
               className="absolute inset-0 w-full h-full object-contain transition-opacity duration-100"
-              style={{ opacity: !showPlaceholder && activeIdx === 1 ? 1 : 0, zIndex: activeIdx === 1 ? 5 : 4 }}
+              style={{ opacity: !showPlaceholder && isSpeaking && activeIdx === 1 ? 1 : 0, zIndex: isSpeaking && activeIdx === 1 ? 6 : 3 }}
               playsInline
             />
 
+            {/* ── "warming up…" tag — shown once, right after connect, before the
+                 backend has even started reading the socket for this session ── */}
+            {isWarmingUp && (
+              <div className="absolute top-3 left-3 z-30 flex items-center gap-1.5 bg-black/50
+                              backdrop-blur-sm px-2.5 py-1.5 rounded-full border border-white/10">
+                <span className="w-1.5 h-1.5 rounded-full bg-primary-400 animate-pulse" />
+                <span className="text-[10px] text-gray-200 font-medium">Warming up avatar…</span>
+              </div>
+            )}
+
             {/* ── "thinking…" tag — shown while a turn is in flight but no reply chunk is playing yet ── */}
-            {!showPlaceholder && loopMode === 'thinking' && !isSpeaking && (
+            {!showPlaceholder && !isWarmingUp && loopMode === 'thinking' && !isSpeaking && (
               <div className="absolute top-3 left-3 z-30 flex items-center gap-1.5 bg-black/50
                               backdrop-blur-sm px-2.5 py-1.5 rounded-full border border-white/10">
                 <span className="w-1.5 h-1.5 rounded-full bg-amber-400 animate-pulse" />
@@ -1462,7 +1651,7 @@ export function ChatInterface({ avatarId, voiceId, resumeSessionId, onSessionCre
           <div className="flex gap-2 items-end">
             <button
               onClick={isRecording ? stopRecording : startRecording}
-              disabled={isProcessing}
+              disabled={isProcessing || isWarmingUp}
               aria-label={isRecording ? 'Stop recording' : 'Start voice recording'}
               aria-pressed={isRecording}
               className={`relative flex-shrink-0 w-10 h-10 rounded-xl flex items-center justify-center
@@ -1471,7 +1660,7 @@ export function ChatInterface({ avatarId, voiceId, resumeSessionId, onSessionCre
                   ? 'bg-red-600 hover:bg-red-500 text-white shadow-[0_0_20px_rgba(239,68,68,0.5)]'
                   : 'bg-surface-700 hover:bg-surface-600 border border-white/10 hover:border-primary-500/40 text-gray-400 hover:text-white'
                 }
-                ${isProcessing ? 'opacity-40 cursor-not-allowed' : ''}
+                ${(isProcessing || isWarmingUp) ? 'opacity-40 cursor-not-allowed' : ''}
               `}
             >
               {isRecording ? <MicOff size={18} /> : <Mic size={18} />}
@@ -1487,9 +1676,9 @@ export function ChatInterface({ avatarId, voiceId, resumeSessionId, onSessionCre
                 onKeyDown={(e) => {
                   if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); sendMessage() }
                 }}
-                placeholder={isRecording ? 'Recording…' : 'Message your avatar… (Enter to send)'}
+                placeholder={isWarmingUp ? 'Warming up avatar…' : isRecording ? 'Recording…' : 'Message your avatar… (Enter to send)'}
                 aria-label="Message your avatar"
-                disabled={isProcessing || isRecording}
+                disabled={isProcessing || isRecording || isWarmingUp}
                 rows={1}
                 className="w-full px-4 py-2.5 rounded-xl bg-surface-700/80 border border-white/10 text-white text-sm
                            placeholder:text-gray-600 focus:outline-none focus:ring-2 focus:ring-primary-500/50
@@ -1512,7 +1701,7 @@ export function ChatInterface({ avatarId, voiceId, resumeSessionId, onSessionCre
             ) : (
               <button
                 onClick={sendMessage}
-                disabled={!inputText.trim() || isRecording}
+                disabled={!inputText.trim() || isRecording || isWarmingUp}
                 aria-label="Send message"
                 className="flex-shrink-0 w-10 h-10 rounded-xl bg-gradient-to-br from-primary-600 to-accent-600
                            flex items-center justify-center text-white hover:shadow-glow
