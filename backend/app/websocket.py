@@ -785,7 +785,7 @@ class ConnectionManager:
                     session_id,
                     {
                         "type": "status",
-                        "message": "Animating…",
+                        "message": "Thinking…",
                         "stage": "animation",
                     },
                 )
