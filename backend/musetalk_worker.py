@@ -363,7 +363,6 @@ class Worker:
             cycle = frames_material
         latent_cycle = [m["latent"] for m in cycle]
 
-        has_next_context = bool(next_audio_path and os.path.exists(next_audio_path))
         ctx_tmp_dir: str | None = None
         try:
             if prev_audio_path or next_audio_path:
@@ -417,17 +416,23 @@ class Worker:
             if video_num == 0:
                 raise RuntimeError("No audio frames extracted (empty/too-short audio?)")
 
-            # When there was no real next-chunk audio to borrow (the true
-            # last chunk of a reply), fall back to the old mitigation:
-            # get_whisper_chunk right-pads the whisper feature array with
-            # zeros "to prevent out of bounds" indexing, so the last
-            # AUDIO_PAD_RIGHT frames' windows straddle into that fabricated
-            # silence instead of getting a fully real window — freeze those
-            # frames on the latest chunk that had a fully real window
-            # instead of predicting each from a partially-fake one. video_num
-            # is unchanged, so muxed audio length is untouched — only which
-            # whisper features drive the last couple of frames changes.
-            if not has_next_context and TAIL_HOLD_FRAMES > 0 and video_num > TAIL_HOLD_FRAMES:
+            # Always freeze the tail, even when we had real next-chunk audio
+            # to borrow. The frontend deliberately holds a chunk's very last
+            # frame on screen while the next one is still rendering/uploading
+            # (MuseTalk takes seconds per chunk, often longer than the chunk
+            # itself plays for, so this happens routinely) — if that last
+            # frame is a genuinely mid-word open mouth (which real trailing
+            # context makes accurate but not necessarily closed), the hold
+            # reads as the avatar's mouth getting stuck open. Freezing here
+            # trades a little tail accuracy for a safe resting shape to be
+            # held during that gap. Real next-chunk context (when supplied)
+            # still improves the frames *before* this hold window, and the
+            # NEXT chunk's own leading edge (via prev_audio_path) still gets
+            # the full benefit of real context, since a chunk's start is
+            # never what gets frozen. video_num is unchanged, so muxed audio
+            # length is untouched — only which whisper features drive the
+            # last couple of frames changes.
+            if TAIL_HOLD_FRAMES > 0 and video_num > TAIL_HOLD_FRAMES:
                 last_good = whisper_chunks[video_num - TAIL_HOLD_FRAMES - 1]
                 whisper_chunks[video_num - TAIL_HOLD_FRAMES:] = last_good.unsqueeze(0).expand(
                     TAIL_HOLD_FRAMES, *last_good.shape
