@@ -231,12 +231,25 @@ export function ChatInterface({ avatarId, voiceId, resumeSessionId, onSessionCre
   // Video playback state — mirrors test_client.html's idle/thinking/chunk model.
   const [isSpeaking, setIsSpeaking] = useState(false)          // true while an actual reply chunk is playing
   const [loopMode, setLoopMode] = useState<'idle' | 'thinking'>('idle')
-  const [activeIdx, setActiveIdx] = useState(0)                // which of videoA/videoB is on top
   const [currentChunkProgress, setCurrentChunkProgress] = useState({ current: 0, total: 0 })
   const [idleVideoUrl, setIdleVideoUrl] = useState<string | null>(null)
   const [thinkingVideoUrl, setThinkingVideoUrl] = useState<string | null>(null)
 
-  // ── Dual video buffer (seamless swap, no black frame) ──────────────────
+  // ── Frame Scheduler (canvas-based, client-side) ─────────────────────────
+  // The three <video> elements below (idle/thinking, chunk A, chunk B) are
+  // decode-only now — permanently invisible, never CSS-faded. A single
+  // <canvas> is the only thing actually shown, and switchTo() (defined
+  // below) is the ONLY function allowed to decide what it draws. This
+  // exists because every black-flash bug found in this file so far had the
+  // same shape: some independent call site (a WS event handler, a video
+  // 'ended' listener, a status message) flipped a <video> element's CSS
+  // opacity without the full picture of what else was in flight, and each
+  // one had to be individually hunted down and fixed. Routing every
+  // visibility decision through one front-pointer + rAF render loop
+  // collapses that whole bug class by construction: the canvas simply
+  // redraws whatever it drew last when nothing new is ready, so it can
+  // never go blank/black, and there is exactly one code path that can
+  // change what's on screen.
   // Two stacked <video> elements, used EXCLUSIVELY for cross-fading between
   // successive reply chunks. The idle/thinking loop lives on its own,
   // entirely separate `videoIdleRef` element below — it used to share this
@@ -250,7 +263,14 @@ export function ChatInterface({ avatarId, voiceId, resumeSessionId, onSessionCre
   const videoIdleRef = useRef<HTMLVideoElement>(null)
   const videoARef = useRef<HTMLVideoElement>(null)
   const videoBRef = useRef<HTMLVideoElement>(null)
+  // Which of videoA/videoB currently holds "the chunk in front" for
+  // download/prebuffer bookkeeping purposes only — no longer drives any
+  // visible state directly (switchTo/canvas owns that).
   const activeIdxRef = useRef(0)
+  const canvasRef = useRef<HTMLCanvasElement>(null)
+  const frontElRef = useRef<HTMLVideoElement | null>(null) // the source switchTo() last pointed the canvas at
+  const fadeRef = useRef<{ from: HTMLVideoElement | null; to: HTMLVideoElement; start: number } | null>(null)
+  const rendererRafRef = useRef<number | null>(null)
   const swapTokenRef = useRef(0)          // bumped to invalidate an in-flight transition (e.g. on barge-in)
   const prebufferedItemRef = useRef<VideoChunk | null>(null)
   const pendingChunkTransitionRef = useRef(false)
@@ -385,6 +405,130 @@ export function ChatInterface({ avatarId, voiceId, resumeSessionId, onSessionCre
     pendulumRafRef.current = requestAnimationFrame(pendulumStep)
   }
 
+  // Reveals `el` only once a real decoded frame has actually been painted,
+  // not merely once the browser signals enough data is buffered ('canplay'/
+  // readyState >= HAVE_FUTURE_DATA fire on buffering state, not on paint).
+  // Flipping opacity on the buffering signal left a gap — often just a few
+  // ms, but on a slow decode start it's long enough to show the underlying
+  // black <video> background — between "this element is now visible" and
+  // "this element actually has pixels", which read as a black flash at the
+  // chunk boundary. requestVideoFrameCallback fires exactly when a frame has
+  // been presented to the compositor, closing that gap; browsers without it
+  // fall back to two rAFs (one for the decode/composite tick, one margin).
+  function revealWhenPainted(el: HTMLVideoElement, token: number, after: () => void) {
+    el.play().catch(() => {})
+    const proceed = () => {
+      if (token !== swapTokenRef.current) return // superseded (e.g. barge-in)
+      after()
+    }
+    const rvfc = (el as HTMLVideoElement & {
+      requestVideoFrameCallback?: (cb: () => void) => number
+    }).requestVideoFrameCallback
+    if (typeof rvfc === 'function') {
+      rvfc.call(el, proceed)
+    } else {
+      requestAnimationFrame(() => requestAnimationFrame(proceed))
+    }
+  }
+
+  // True once `el` has a real decoded frame drawImage() can actually paint —
+  // NOT the same check as revealWhenPainted's compositor-paint wait, this is
+  // just "has the decoder produced pixel data at all" (readyState
+  // HAVE_CURRENT_DATA + known intrinsic size). Canvas drawImage reads
+  // straight from the decoder, so — unlike CSS-opacity compositing of an
+  // on-screen <video> element — it doesn't care whether the element itself
+  // has ever been painted to the page.
+  function hasPaintableFrame(el: HTMLVideoElement | null): el is HTMLVideoElement {
+    return !!el && el.readyState >= 2 && el.videoWidth > 0
+  }
+
+  // Letterbox-fit draw, matching the old CSS `object-contain` behavior.
+  function drawContain(ctx: CanvasRenderingContext2D, video: HTMLVideoElement, cw: number, ch: number) {
+    const vw = video.videoWidth, vh = video.videoHeight
+    if (!vw || !vh) return
+    const scale = Math.min(cw / vw, ch / vh)
+    const w = vw * scale, h = vh * scale
+    ctx.drawImage(video, (cw - w) / 2, (ch - h) / 2, w, h)
+  }
+
+  // The single authoritative "what is on screen right now" decision — every
+  // other function in this file that wants to change what's visible must
+  // route through here instead of touching a <video>'s CSS directly (see
+  // the Frame Scheduler comment by the refs above for why). Starts a short
+  // cross-dissolve on the canvas render loop unless `fade: false` (used for
+  // the instant cut back to idle on barge-in). Also owns `isSpeaking`,
+  // derived from the target element's own dataset.mode — one less piece of
+  // state for callers to remember to keep in sync.
+  const FRAME_SCHEDULER_FADE_MS = 180
+  function switchTo(el: HTMLVideoElement, opts: { fade?: boolean } = {}) {
+    const { fade = true } = opts
+    const speaking = (el.dataset.mode || '').startsWith('chunk:')
+    if (frontElRef.current === el) {
+      setIsSpeaking(speaking)
+      return
+    }
+    fadeRef.current = fade
+      ? { from: frontElRef.current, to: el, start: performance.now() }
+      : null
+    frontElRef.current = el
+    setIsSpeaking(speaking)
+  }
+
+  // Persistent render loop: draws whichever element switchTo() last pointed
+  // at (cross-dissolving over FRAME_SCHEDULER_FADE_MS when it just changed)
+  // onto the visible canvas every frame. Deliberately never clears the
+  // canvas before confirming it has something new to draw — if a source
+  // momentarily lacks a decoded frame (e.g. mid-seek during the idle
+  // pendulum scrub), the canvas simply keeps showing its last-drawn pixels
+  // instead of flashing to black.
+  useEffect(() => {
+    const canvas = canvasRef.current
+    if (!canvas) return
+    const ctx = canvas.getContext('2d')
+    if (!ctx) return
+
+    const resize = () => {
+      const rect = canvas.getBoundingClientRect()
+      const dpr = window.devicePixelRatio || 1
+      const w = Math.max(1, Math.round(rect.width * dpr))
+      const h = Math.max(1, Math.round(rect.height * dpr))
+      if (canvas.width !== w || canvas.height !== h) {
+        canvas.width = w
+        canvas.height = h
+      }
+    }
+    const ro = new ResizeObserver(resize)
+    ro.observe(canvas)
+    resize()
+
+    const tick = () => {
+      const cw = canvas.width, ch = canvas.height
+      const fade = fadeRef.current
+      if (fade) {
+        const t = Math.min(1, (performance.now() - fade.start) / FRAME_SCHEDULER_FADE_MS)
+        if (hasPaintableFrame(fade.from)) {
+          ctx.globalAlpha = 1
+          drawContain(ctx, fade.from, cw, ch)
+        }
+        if (hasPaintableFrame(fade.to)) {
+          ctx.globalAlpha = t
+          drawContain(ctx, fade.to, cw, ch)
+          ctx.globalAlpha = 1
+        }
+        if (t >= 1) fadeRef.current = null
+      } else if (hasPaintableFrame(frontElRef.current)) {
+        drawContain(ctx, frontElRef.current, cw, ch)
+      }
+      rendererRafRef.current = requestAnimationFrame(tick)
+    }
+    rendererRafRef.current = requestAnimationFrame(tick)
+
+    return () => {
+      ro.disconnect()
+      if (rendererRafRef.current) cancelAnimationFrame(rendererRafRef.current)
+    }
+  }, [])
+
   // Cross-fades between successive REPLY CHUNKS only — the idle/thinking
   // loop has its own dedicated element (videoIdleRef, see playLoop()) and
   // never goes through here, so this never has to coordinate with it.
@@ -403,8 +547,8 @@ export function ChatInterface({ avatarId, voiceId, resumeSessionId, onSessionCre
       pendingChunkTransitionRef.current = false
       const outgoing = activeVideoEl()!
       activeIdxRef.current = 1 - activeIdxRef.current
-      setActiveIdx(activeIdxRef.current)
       const incoming = activeVideoEl()!
+      switchTo(incoming) // hands the canvas the cross-dissolve; also flips isSpeaking
       incoming.play().catch(() => {})
       outgoing.pause()
       if (outgoing.dataset.objectUrl) {
@@ -421,6 +565,7 @@ export function ChatInterface({ avatarId, voiceId, resumeSessionId, onSessionCre
 
     if (active.dataset.mode === mode && active.src === src) {
       pendingChunkTransitionRef.current = false
+      switchTo(active) // already showing this exact chunk — make sure it's marked speaking
       return
     }
 
@@ -429,9 +574,12 @@ export function ChatInterface({ avatarId, voiceId, resumeSessionId, onSessionCre
     standby.dataset.mode = mode
     if (objectUrl) standby.dataset.objectUrl = objectUrl; else delete standby.dataset.objectUrl
 
-    if (standby.src === src && standby.readyState >= 3) { commit(); return }
+    if (standby.src === src && standby.readyState >= 3) {
+      revealWhenPainted(standby, myToken, commit)
+      return
+    }
 
-    const onReady = () => { cleanup(); commit() }
+    const onReady = () => { cleanup(); revealWhenPainted(standby, myToken, commit) }
     // A genuinely broken chunk (bad encode, truncated blob) must not leave
     // the pipeline stuck: isPlayingChunkRef was already set true by the
     // caller (playChunk) before this transition started, and nothing else
@@ -443,7 +591,10 @@ export function ChatInterface({ avatarId, voiceId, resumeSessionId, onSessionCre
       pendingChunkTransitionRef.current = false
       if (myToken !== swapTokenRef.current) return // superseded (e.g. barge-in)
       isPlayingChunkRef.current = false
-      setIsSpeaking(false)
+      // Don't touch isSpeaking directly — tryPlayNext() below will either
+      // play the next queued chunk (switchTo flips it true) or, once nothing
+      // is left, call playLoop() (switchTo flips it false). Either way the
+      // single switchTo() call path is what should own this, not here.
       tryPlayNext()
     }
     function cleanup() {
@@ -465,15 +616,19 @@ export function ChatInterface({ avatarId, voiceId, resumeSessionId, onSessionCre
   // Manages ONLY the dedicated idle/thinking element — entirely independent
   // of the chunk-pair cross-fade in transitionTo(). Always safe to call:
   // there's no shared standby slot here for a chunk transition to race.
-  function playLoop() {
+  // `immediate` skips the cross-dissolve for a snap-cut back to idle — used
+  // by resetPlayback() on barge-in, where a lingering fade to whatever chunk
+  // was just cut off would look like a stutter, not a clean interrupt.
+  function playLoop(opts: { immediate?: boolean } = {}) {
+    const { immediate = false } = opts
     const { src, mode } = currentLoop()
     setLoopMode(mode)
-    setIsSpeaking(false) // hide the chunk pair, idle element becomes visible
     const idleEl = videoIdleRef.current
-    if (!idleEl || !src) return // nothing generated yet for this avatar — placeholder stays up
+    if (!idleEl || !src) { setIsSpeaking(false); return } // nothing generated yet — placeholder stays up
     if (idleEl.src === src) {
       idleEl.dataset.mode = mode
       resumePendulumOrPlay(idleEl)
+      switchTo(idleEl, { fade: !immediate })
       return
     }
     idleEl.loop = false
@@ -482,6 +637,7 @@ export function ChatInterface({ avatarId, voiceId, resumeSessionId, onSessionCre
     const onReady = () => {
       idleEl.removeEventListener('canplay', onReady)
       startPendulum(idleEl)
+      switchTo(idleEl, { fade: !immediate })
     }
     idleEl.addEventListener('canplay', onReady, { once: true })
     idleEl.src = src
@@ -513,27 +669,34 @@ export function ChatInterface({ avatarId, voiceId, resumeSessionId, onSessionCre
 
   function commitPrebuffered(item: VideoChunk) {
     isPlayingChunkRef.current = true
-    setIsSpeaking(true)
-    swapTokenRef.current++ // invalidate any stray in-flight transitionTo commit
+    const myToken = ++swapTokenRef.current // invalidate any stray in-flight transitionTo commit
     const outgoing = activeVideoEl()!
-    activeIdxRef.current = 1 - activeIdxRef.current
-    setActiveIdx(activeIdxRef.current)
-    const incoming = activeVideoEl()!
-    incoming.play().catch(() => {})
-    outgoing.pause()
-    if (outgoing.dataset.objectUrl) {
-      URL.revokeObjectURL(outgoing.dataset.objectUrl)
-      delete outgoing.dataset.objectUrl
-    }
-    prebufferNext()
-    // Fires React state updates — must run LAST, after prebufferNext(),
-    // same reasoning as the call at the end of transitionTo's commit().
-    openGate() // this chunk is actually playing now — reveal text if this is the turn's first
+    const incoming = standbyVideoEl()!
+    // Same paint-gated reveal as transitionTo(): the prebuffer only proved
+    // 'canplay' fired at some earlier point, not that a frame is painted
+    // right now (the element may have sat idle for a while since), so the
+    // swap still needs to wait for an actual composited frame. switchTo()
+    // starts the canvas cross-dissolve and flips isSpeaking together, so the
+    // previous chunk's frozen last frame stays on screen (instead of a
+    // premature reveal of whatever the "active" slot held before) right up
+    // until the new one is actually ready to show.
+    revealWhenPainted(incoming, myToken, () => {
+      activeIdxRef.current = 1 - activeIdxRef.current
+      switchTo(incoming)
+      outgoing.pause()
+      if (outgoing.dataset.objectUrl) {
+        URL.revokeObjectURL(outgoing.dataset.objectUrl)
+        delete outgoing.dataset.objectUrl
+      }
+      prebufferNext()
+      // Fires React state updates — must run LAST, after prebufferNext(),
+      // same reasoning as the call at the end of transitionTo's commit().
+      openGate() // this chunk is actually playing now — reveal text if this is the turn's first
+    })
   }
 
   function playChunk(item: VideoChunk) {
     isPlayingChunkRef.current = true
-    setIsSpeaking(true)
     transitionTo(item.url, 'chunk:' + item.index, {
       muted: isMutedRef.current, objectUrl: item.url,
       onCommit: () => prebufferNext(),
@@ -629,20 +792,38 @@ export function ChatInterface({ avatarId, voiceId, resumeSessionId, onSessionCre
     }
   }
 
+  // True only when there's truly nothing left in the reply pipeline — not
+  // just "not playing right now". A chunk already announced via
+  // 'video_chunk' but still mid-download, or one already downloaded and
+  // sitting in playQueueRef waiting for tryPlayNext() to pick it up, is a
+  // gap of at most one network round-trip, not a real end. Every call site
+  // that decides whether to reveal the idle/thinking loop must use this —
+  // a single call site (the 'status' handler) used to check only
+  // isPlayingChunkRef, which fires before EVERY chunk's TTS+animation (not
+  // just the first): on a normal mid-reply gap it flipped to idle/thinking
+  // immediately, then back to the chunk once it arrived — a visible jump to
+  // a wholly different clip and back, exactly the "one video ends, another
+  // starts" seam this whole guard exists to prevent everywhere else.
+  function nothingComingSoon() {
+    return (
+      playQueueRef.current.length === 0 &&
+      downloadQueueRef.current.length === 0 &&
+      !downloadingRef.current
+    )
+  }
+
   function tryPlayNext() {
     if (isPlayingChunkRef.current) return
     if (playQueueRef.current.length === 0) {
       maybeFinishResponding()
       // Only actually drop to the idle/thinking loop if nothing is coming
-      // "soon" either — a chunk already announced via 'video_chunk' but
-      // still mid-download is a matter of one network round-trip, not a
-      // real gap. Flipping to idle here raced the download: the loop's own
-      // transitionTo would grab the standby element right as the chunk's
-      // own transitionTo needed it, so the swap that actually mattered kept
-      // getting superseded before it could commit — the video would sit on
-      // idle/thinking far longer than the real gap, reading as "stalled"
-      // even though every chunk was still arriving underneath it.
-      if (downloadQueueRef.current.length === 0 && !downloadingRef.current) playLoop()
+      // "soon" either — flipping to idle here raced the download: the
+      // loop's own transitionTo would grab the standby element right as the
+      // chunk's own transitionTo needed it, so the swap that actually
+      // mattered kept getting superseded before it could commit — the video
+      // would sit on idle/thinking far longer than the real gap, reading as
+      // "stalled" even though every chunk was still arriving underneath it.
+      if (nothingComingSoon()) playLoop()
       return
     }
     const item = playQueueRef.current.shift()!
@@ -664,7 +845,6 @@ export function ChatInterface({ avatarId, voiceId, resumeSessionId, onSessionCre
     pendingChunkTransitionRef.current = false
     swapTokenRef.current++
     isPlayingChunkRef.current = false
-    setIsSpeaking(false)
     stopPendulum()
     // The turn this buffered/held text belonged to is being torn down —
     // don't let it leak into whatever turn starts next.
@@ -683,11 +863,13 @@ export function ChatInterface({ avatarId, voiceId, resumeSessionId, onSessionCre
       delete v.dataset.mode
     })
     activeIdxRef.current = 0
-    setActiveIdx(0)
     isRespondingRef.current = false
     streamEndedRef.current = false
     setCurrentChunkProgress({ current: 0, total: 0 })
-    playLoop()
+    // Immediate (no cross-dissolve) cut back to idle — a lingering fade from
+    // whatever chunk just got cut off would read as a stutter, not a clean
+    // barge-in interrupt.
+    playLoop({ immediate: true })
   }
 
   // Attach ended/error handlers once on mount. These only ever touch refs
@@ -697,10 +879,21 @@ export function ChatInterface({ avatarId, voiceId, resumeSessionId, onSessionCre
   // always 'chunk:N'), and the idle/thinking loop's pendulum-reverse-at-end
   // logic lives entirely on its own dedicated element.
   useEffect(() => {
+    // Deliberately does NOT setIsSpeaking(false) here. That used to fire the
+    // instant a chunk ended regardless of whether the next one was ready,
+    // which (since the idle loop's visibility is bound straight to
+    // isSpeaking in the JSX) revealed the idle loop for the entire network
+    // gap while the next chunk was still downloading — the exact "stalled"
+    // flash the comment on tryPlayNext's empty branch already tries to
+    // avoid, but only partially: that guard controls whether playLoop() is
+    // CALLED, not whether the idle loop is VISIBLE. Leaving isSpeaking true
+    // here holds the just-ended element on its last frame (a still image,
+    // not a flash) until tryPlayNext() either commits the next chunk
+    // (paint-gated swap) or — only once nothing else is coming — calls
+    // playLoop(), which is the sole place that actually flips this false.
     const onChunkEndedFactory = (el: HTMLVideoElement | null) => () => {
       if (!el || el !== activeVideoEl()) return
       isPlayingChunkRef.current = false
-      setIsSpeaking(false)
       tryPlayNext()
     }
     // Scoped exactly like onChunkEndedFactory — an 'error' firing on the
@@ -717,7 +910,9 @@ export function ChatInterface({ avatarId, voiceId, resumeSessionId, onSessionCre
     const onChunkErrorFactory = (el: HTMLVideoElement | null) => () => {
       if (!el || el !== activeVideoEl()) return
       isPlayingChunkRef.current = false
-      setIsSpeaking(false)
+      // Same reasoning as onChunkEndedFactory — leave isSpeaking alone and
+      // let tryPlayNext()/playLoop() decide, instead of force-revealing the
+      // idle loop the instant this fires.
       tryPlayNext()
     }
     const onIdleEnded = () => {
@@ -943,9 +1138,9 @@ export function ChatInterface({ avatarId, voiceId, resumeSessionId, onSessionCre
         // Only actually drops to idle once every chunk has been fetched and
         // played — the server can send this the instant it's queued the
         // last sentence, well before that chunk's video finishes downloading
-        // on our end. Same guard as tryPlayNext()'s empty branch.
+        // on our end.
         maybeFinishResponding()
-        if (!isPlayingChunkRef.current && downloadQueueRef.current.length === 0 && !downloadingRef.current) playLoop()
+        if (!isPlayingChunkRef.current && nothingComingSoon()) playLoop()
         break
 
       case 'status':
@@ -953,7 +1148,11 @@ export function ChatInterface({ avatarId, voiceId, resumeSessionId, onSessionCre
         streamEndedRef.current = false
         setIsProcessing(true)
         setStatusMsg(data.message || 'Processing…')
-        if (!isPlayingChunkRef.current) playLoop() // switch to the thinking loop while we wait
+        // The backend sends this before EVERY chunk's TTS+animation, not
+        // just the first — must use the same "really nothing coming" guard
+        // as everywhere else, or this fires on every normal mid-reply gap
+        // and yanks the display to idle/thinking and back for each chunk.
+        if (!isPlayingChunkRef.current && nothingComingSoon()) playLoop()
         break
 
       case 'error':
@@ -1296,36 +1495,22 @@ export function ChatInterface({ avatarId, voiceId, resumeSessionId, onSessionCre
               <IdleAvatar imageUrl={avatarImageUrl} />
             </div>
 
-            {/* ── Idle/thinking loop — its own dedicated element, never shared
-                 with reply-chunk playback. Visible whenever a chunk isn't. ── */}
-            {/* `muted` is intentionally NOT a controlled prop here — it's driven
-                imperatively by the playback engine (loops always muted, chunks
-                follow isMuted) via refs. Binding it through JSX would make React
-                force it back on every re-render and permanently silence chunks.
-                `object-contain` (not `cover`) mirrors test_client.html's stage —
-                the full frame is always visible, letterboxed instead of cropped,
-                so a full-body avatar never loses its head/feet. */}
-            <video
-              ref={videoIdleRef}
-              className="absolute inset-0 w-full h-full object-contain transition-opacity duration-100"
-              style={{ opacity: !showPlaceholder && !isSpeaking ? 1 : 0, zIndex: !isSpeaking ? 5 : 4 }}
-              playsInline
+            {/* ── Frame Scheduler canvas — the ONLY visible video surface.
+                 switchTo() (see refs section) decides what it draws every
+                 frame; the three <video> elements below are decode-only
+                 sources and are never shown directly. `muted` on those
+                 elements is driven imperatively by the playback engine
+                 (loops always muted, chunks follow isMuted) via refs, not
+                 as a controlled prop — binding it through JSX would force
+                 it back on every re-render and permanently silence chunks. ── */}
+            <canvas
+              ref={canvasRef}
+              className="absolute inset-0 w-full h-full transition-opacity duration-200 ease-in-out"
+              style={{ opacity: showPlaceholder ? 0 : 1, zIndex: 4 }}
             />
-
-            {/* ── Reply-chunk pair: cross-fades between successive chunks only,
-                 completely separate from the idle/thinking element above ── */}
-            <video
-              ref={videoARef}
-              className="absolute inset-0 w-full h-full object-contain transition-opacity duration-100"
-              style={{ opacity: !showPlaceholder && isSpeaking && activeIdx === 0 ? 1 : 0, zIndex: isSpeaking && activeIdx === 0 ? 6 : 3 }}
-              playsInline
-            />
-            <video
-              ref={videoBRef}
-              className="absolute inset-0 w-full h-full object-contain transition-opacity duration-100"
-              style={{ opacity: !showPlaceholder && isSpeaking && activeIdx === 1 ? 1 : 0, zIndex: isSpeaking && activeIdx === 1 ? 6 : 3 }}
-              playsInline
-            />
+            <video ref={videoIdleRef} className="absolute inset-0 w-full h-full opacity-0 pointer-events-none" playsInline />
+            <video ref={videoARef} className="absolute inset-0 w-full h-full opacity-0 pointer-events-none" playsInline />
+            <video ref={videoBRef} className="absolute inset-0 w-full h-full opacity-0 pointer-events-none" playsInline />
 
             {/* ── "warming up…" tag — shown once, right after connect, before the
                  backend has even started reading the socket for this session ── */}

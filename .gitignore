@@ -48,7 +48,6 @@ pnpm-lock.yaml
 *.bin
 *.onnx
 *.safetensors
-models/
 uploads/
 outputs/
 voice_profiles/
