@@ -738,6 +738,20 @@ class ConnectionManager:
         """
         Consume sentences from the queue and run TTS + animation for each,
         streaming video_chunk events to the frontend as they complete.
+
+        Each chunk's animation is given real leading/trailing audio context
+        borrowed from its neighbours (instead of the zero-silence MuseTalk
+        falls back to at a clip's own edges — see musetalk_worker.py), so
+        the mouth doesn't visibly reset at chunk boundaries. Getting the
+        *trailing* side of that context for chunk N means chunk N+1's audio
+        must already be synthesized before N is rendered, so this looks one
+        chunk ahead: after synthesizing the current chunk's own audio, it
+        opportunistically (non-blocking) checks whether the next sentence is
+        already queued and, if so, synthesizes its audio early and carries it
+        into the next loop iteration instead of pulling it from the queue
+        again. The very first chunk skips this lookahead so a reply's
+        perceived start latency is unaffected — only interior boundaries pay
+        the (small, TTS-only) lookahead cost.
         """
         data = self.session_data.get(session_id, {})
         avatar_image = data.get("avatar_image_local")
@@ -767,18 +781,70 @@ class ConnectionManager:
             },
         )
 
+        session_dir = _private_session_dir(session_id)
+
+        async def _synth(text: str) -> Path:
+            nonlocal fallback_announced
+            out = session_dir / f"{uuid.uuid4().hex[:12]}_audio.wav"
+            with span(
+                "tts.synthesize",
+                **{"chars": len(text), "lang": language, "cloned": bool(speaker_wav)},
+            ):
+                synth = await tts_service.synthesize(
+                    text=text, output_path=str(out), speaker_wav=speaker_wav, language=language
+                )
+            if synth.fallback and not fallback_announced:
+                fallback_announced = True
+                await self.send_message(
+                    session_id,
+                    {
+                        "type": "tts_fallback",
+                        "engine": synth.engine,
+                        "voice_cloned": synth.voice_cloned,
+                        "message": (
+                            "Cloned voice unavailable — using default voice for this reply."
+                            if speaker_wav
+                            else f"Voice engine fell back to {synth.engine} for this reply."
+                        ),
+                    },
+                )
+            return out
+
+        # `pending_*` carries a sentence (and, once synthesized, its audio)
+        # from one loop iteration's lookahead into the next one, instead of
+        # it being pulled from `queue` again. `end_seen` records that we've
+        # already consumed the producer's `None` end-of-stream sentinel via
+        # a lookahead peek, so the top of the loop must stop instead of
+        # awaiting `queue.get()` again (nothing more will ever arrive).
+        pending_text: Optional[str] = None
+        pending_audio: Optional[Path] = None
+        end_seen = False
+        # Previous chunk's own audio, kept one extra iteration so it can be
+        # passed as this chunk's leading context; `prev_cleanup` is the one
+        # before that, now safe to delete.
+        prev_audio_path: Optional[Path] = None
+        prev_cleanup: Optional[Path] = None
+
         while True:
-            sentence = await queue.get()
-            if sentence is None:
+            if pending_text is not None:
+                sentence = pending_text
+                tmp_audio: Optional[Path] = pending_audio
+                pending_text = None
+                pending_audio = None
+            elif end_seen:
                 break
+            else:
+                sentence = await queue.get()
+                if sentence is None:
+                    break
+                tmp_audio = None
 
             if session_id not in self.active_connections:
+                if tmp_audio is not None:
+                    tmp_audio.unlink(missing_ok=True)
                 break  # client disconnected mid-stream
 
-            job_id = uuid.uuid4().hex[:12]
-            session_dir = _private_session_dir(session_id)
-            tmp_audio = session_dir / f"{job_id}_audio.wav"
-            tmp_video = session_dir / f"{job_id}_video.mp4"
+            tmp_video = session_dir / f"{uuid.uuid4().hex[:12]}_video.mp4"
 
             try:
                 await self.send_message(
@@ -790,40 +856,44 @@ class ConnectionManager:
                     },
                 )
 
-                with span(
-                    "tts.synthesize",
-                    **{"chars": len(sentence), "lang": language, "cloned": bool(speaker_wav)},
-                ):
-                    synth = await tts_service.synthesize(
-                        text=sentence,
-                        output_path=str(tmp_audio),
-                        speaker_wav=speaker_wav,
-                        language=language,
-                    )
+                if tmp_audio is None:
+                    tmp_audio = await _synth(sentence)
 
-                # Notify the client exactly once if Chatterbox bailed and
-                # we ended up serving the un-cloned gTTS voice instead.
-                if synth.fallback and not fallback_announced:
-                    fallback_announced = True
-                    await self.send_message(
-                        session_id,
-                        {
-                            "type": "tts_fallback",
-                            "engine": synth.engine,
-                            "voice_cloned": synth.voice_cloned,
-                            "message": (
-                                "Cloned voice unavailable — using default voice for this reply."
-                                if speaker_wav
-                                else f"Voice engine fell back to {synth.engine} for this reply."
-                            ),
-                        },
-                    )
+                # Best-effort one-chunk lookahead (skipped for the very first
+                # chunk to protect first-video latency): if the next sentence
+                # is already queued, synthesize its audio now so its head can
+                # serve as real trailing context for THIS chunk's boundary.
+                # If nothing is queued yet, we just proceed without it — that
+                # boundary falls back to the old zero-pad behaviour, same as
+                # before this change.
+                next_audio_path: Optional[str] = None
+                if chunk_index > 0 and not end_seen:
+                    try:
+                        candidate = queue.get_nowait()
+                    except asyncio.QueueEmpty:
+                        candidate = None
+                    else:
+                        if candidate is None:
+                            end_seen = True
+                        else:
+                            try:
+                                candidate_audio = await _synth(candidate)
+                                next_audio_path = str(candidate_audio)
+                                pending_text = candidate
+                                pending_audio = candidate_audio
+                            except Exception as e:
+                                logger.error(f"Lookahead TTS failed [{session_id}]: {e}")
+                                # Don't lose the sentence — next loop
+                                # iteration will synth it normally.
+                                pending_text = candidate
 
                 with span("avatar.animate", **{"chunk": chunk_index}):
                     await avatar_animator.animate(
                         avatar_image_path=avatar_image,
                         audio_path=str(tmp_audio),
                         output_path=str(tmp_video),
+                        prev_audio_path=str(prev_audio_path) if prev_audio_path else None,
+                        next_audio_path=next_audio_path,
                     )
 
                 ts = int(datetime.now(timezone.utc).timestamp() * 1000)
@@ -854,8 +924,18 @@ class ConnectionManager:
                 logger.error(f"Chunk {chunk_index} failed [{session_id}]: {e}")
 
             finally:
-                tmp_audio.unlink(missing_ok=True)
                 tmp_video.unlink(missing_ok=True)
+                if prev_cleanup is not None:
+                    prev_cleanup.unlink(missing_ok=True)
+                prev_cleanup = prev_audio_path
+                prev_audio_path = tmp_audio
+
+        if prev_audio_path is not None:
+            prev_audio_path.unlink(missing_ok=True)
+        if prev_cleanup is not None:
+            prev_cleanup.unlink(missing_ok=True)
+        if pending_audio is not None:
+            pending_audio.unlink(missing_ok=True)
 
         await self.send_message(
             session_id,

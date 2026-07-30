@@ -212,23 +212,29 @@ class AvatarAnimator:
             pass
 
     async def _worker_infer(
-        self, image_path: str, audio_path: str, output_path: str, coord_cache: Optional[str]
+        self,
+        image_path: str,
+        audio_path: str,
+        output_path: str,
+        coord_cache: Optional[str],
+        prev_audio_path: Optional[str] = None,
+        next_audio_path: Optional[str] = None,
     ) -> str:
         """Send one job to the persistent worker and await its result."""
         async with self._worker_lock:
             proc = await self._ensure_worker()
 
-            job = (
-                json.dumps(
-                    {
-                        "image": str(Path(image_path).resolve()),
-                        "audio": str(Path(audio_path).resolve()),
-                        "output": str(Path(output_path).resolve()),
-                        "coord_cache": coord_cache,
-                    }
-                )
-                + "\n"
-            )
+            job_dict = {
+                "image": str(Path(image_path).resolve()),
+                "audio": str(Path(audio_path).resolve()),
+                "output": str(Path(output_path).resolve()),
+                "coord_cache": coord_cache,
+            }
+            if prev_audio_path and Path(prev_audio_path).exists():
+                job_dict["prev_audio"] = str(Path(prev_audio_path).resolve())
+            if next_audio_path and Path(next_audio_path).exists():
+                job_dict["next_audio"] = str(Path(next_audio_path).resolve())
+            job = json.dumps(job_dict) + "\n"
 
             # If the worker died (OOM/segfault) its stdin is closed; writing
             # raises BrokenPipeError. Reset the handle so the NEXT job respawns
@@ -353,10 +359,17 @@ class AvatarAnimator:
         audio_path: str,
         output_path: str,
         cache_key: Optional[str] = None,
+        prev_audio_path: Optional[str] = None,
+        next_audio_path: Optional[str] = None,
     ) -> str:
         """
         Animate avatar with audio. Returns path to the generated video.
         Falls back to simple (static image + audio) on any engine failure.
+
+        prev_audio_path/next_audio_path are the neighbouring chunks' own
+        audio files (optional, musetalk engine only) — their tail/head is
+        borrowed as real whisper context at this chunk's boundaries instead
+        of fabricated silence, to avoid a mouth "reset" at chunk seams.
         """
         if not self._initialised:
             await self.initialize()
@@ -371,7 +384,9 @@ class AvatarAnimator:
                 # frame (see musetalk_worker.py). Extracting a single frame
                 # here would silently downgrade every video avatar to a
                 # still-image lip-sync, which defeats the point.
-                return await self._animate_musetalk(avatar_image_path, audio_path, output_path)
+                return await self._animate_musetalk(
+                    avatar_image_path, audio_path, output_path, prev_audio_path, next_audio_path
+                )
             else:
                 return await self._animate_simple_from_source(avatar_image_path, audio_path, output_path)
         except Exception:
@@ -435,6 +450,8 @@ class AvatarAnimator:
         avatar_path: str,
         audio_path: str,
         output_path: str,
+        prev_audio_path: Optional[str] = None,
+        next_audio_path: Optional[str] = None,
     ) -> str:
         """Run MuseTalk via persistent worker (models stay loaded between calls)."""
         musetalk_dir: Path = self._musetalk_dir  # type: ignore[assignment]
@@ -453,7 +470,9 @@ class AvatarAnimator:
             if legacy_cache.exists() and not Path(coord_cache).exists():
                 legacy_cache.unlink(missing_ok=True)
 
-        await self._worker_infer(avatar_path, audio_path, output_path, coord_cache)
+        await self._worker_infer(
+            avatar_path, audio_path, output_path, coord_cache, prev_audio_path, next_audio_path
+        )
 
         logger.info(f"MuseTalk animation done: {output_path}")
         return output_path

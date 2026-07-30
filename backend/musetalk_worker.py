@@ -10,9 +10,16 @@ Protocol (spoken over stdin/stdout, one JSON object per line):
 
   Per job:
     stdin  <- {"image": "<avatar photo path>", "audio": "<wav/mp3 path>",
-               "output": "<mp4 path to write>", "coord_cache": "<pkl path or null>"}
+               "output": "<mp4 path to write>", "coord_cache": "<pkl path or null>",
+               "prev_audio": "<wav/mp3 path or null>", "next_audio": "<wav/mp3 path or null>"}
     stdout -> {"status": "ok"}                 on success
     stdout -> {"status": "error", "msg": "..."} on failure (worker keeps running)
+
+  "prev_audio"/"next_audio" are the *neighbouring* chunks' own audio files
+  (optional). When given, their tail/head is borrowed as real whisper
+  context at this chunk's boundaries instead of the zero-silence padding
+  get_whisper_chunk falls back to — see Worker._build_context_audio and the
+  comment above the TAIL_HOLD_FRAMES application in Worker.infer().
 
 This file is meant to live at <MUSETALK_PATH>/scripts/musetalk_worker.py, i.e.
 inside the TMElyralab/MuseTalk checkout that scripts/setup_musetalk.sh creates.
@@ -58,6 +65,7 @@ def _send_ready() -> None:
 
 import glob  # noqa: E402
 import json  # noqa: E402
+import math  # noqa: E402
 import os  # noqa: E402
 import pickle  # noqa: E402
 import shutil  # noqa: E402
@@ -68,7 +76,9 @@ import traceback  # noqa: E402
 from pathlib import Path  # noqa: E402
 
 import cv2  # noqa: E402
+import librosa  # noqa: E402
 import numpy as np  # noqa: E402
+import soundfile as sf  # noqa: E402
 import torch  # noqa: E402
 
 # PyTorch >=2.6 flipped torch.load's default to weights_only=True, which
@@ -116,6 +126,12 @@ AUDIO_PAD_RIGHT = int(os.environ.get("MUSETALK_AUDIO_PAD_RIGHT", "2"))
 # fabricated end-padding (see get_whisper_chunk).
 TAIL_HOLD_FRAMES = int(os.environ.get("MUSETALK_TAIL_HOLD_FRAMES", str(AUDIO_PAD_RIGHT)))
 print("Using MuseTalk tail-hold frames:", TAIL_HOLD_FRAMES, file=sys.stderr)
+# How much real neighbour audio to borrow at each chunk boundary (see
+# Worker._build_context_audio) so the whisper feature window has genuine
+# context instead of fabricated silence. Only ~AUDIO_PAD_RIGHT*3 timesteps
+# (~240ms) is actually needed to fill the padding window; the default here
+# is deliberately generous headroom, not a tuned minimum.
+CONTEXT_AUDIO_SEC = float(os.environ.get("MUSETALK_CONTEXT_SEC", "0.5"))
 # Cap on how many source frames we'll extract/encode for a *video* avatar.
 # Long videos get evenly re-sampled down to this many frames before the
 # ping-pong cycle is built, so prep time and cache size stay bounded.
@@ -281,10 +297,59 @@ class Worker:
 
         return material
 
+    # ── cross-chunk audio context ───────────────────────────────────────────
+
+    def _build_context_audio(
+        self, audio_path: str, prev_audio_path: str | None, next_audio_path: str | None
+    ) -> tuple[str, int, int, str]:
+        """Build a temp wav = [tail of prev] + [own audio] + [head of next],
+        so get_whisper_chunk sees real continuous speech at this chunk's
+        boundaries instead of the zero-padding it fabricates when there's no
+        neighbour. Returns (combined_wav_path, own_frame_offset,
+        own_num_frames, tmp_dir) — the caller slices the whisper_chunks
+        computed from combined_wav_path down to
+        [own_frame_offset : own_frame_offset + own_num_frames] and must
+        shutil.rmtree(tmp_dir) once done with combined_wav_path.
+        """
+        sr = 16000
+        own, _ = librosa.load(audio_path, sr=sr)
+
+        pre_ctx = np.zeros(0, dtype=own.dtype)
+        if prev_audio_path and os.path.exists(prev_audio_path):
+            prev_full, _ = librosa.load(prev_audio_path, sr=sr)
+            n = min(len(prev_full), int(CONTEXT_AUDIO_SEC * sr))
+            if n > 0:
+                pre_ctx = prev_full[len(prev_full) - n:]
+
+        post_ctx = np.zeros(0, dtype=own.dtype)
+        if next_audio_path and os.path.exists(next_audio_path):
+            next_full, _ = librosa.load(next_audio_path, sr=sr)
+            n = min(len(next_full), int(CONTEXT_AUDIO_SEC * sr))
+            if n > 0:
+                post_ctx = next_full[:n]
+
+        combined = np.concatenate([pre_ctx, own, post_ctx])
+
+        tmp_dir = tempfile.mkdtemp(prefix="musetalk_ctx_")
+        combined_path = os.path.join(tmp_dir, "combined.wav")
+        sf.write(combined_path, combined, sr)
+
+        frame_offset = math.floor(len(pre_ctx) / sr * FPS)
+        own_num_frames = math.floor(len(own) / sr * FPS)
+        return combined_path, frame_offset, own_num_frames, tmp_dir
+
     # ── inference for one (avatar, audio) pair ──────────────────────────────
 
     @torch.no_grad()
-    def infer(self, image_path: str, audio_path: str, output_path: str, coord_cache: str | None) -> None:
+    def infer(
+        self,
+        image_path: str,
+        audio_path: str,
+        output_path: str,
+        coord_cache: str | None,
+        prev_audio_path: str | None = None,
+        next_audio_path: str | None = None,
+    ) -> None:
         material = self._prepare_avatar(image_path, coord_cache)
         frames_material = material["frames"]
 
@@ -298,40 +363,78 @@ class Worker:
             cycle = frames_material
         latent_cycle = [m["latent"] for m in cycle]
 
-        whisper_input_features, librosa_length = self.audio_processor.get_audio_feature(
-            audio_path, weight_dtype=self.weight_dtype
-        )
-        whisper_chunks = self.audio_processor.get_whisper_chunk(
-            whisper_input_features,
-            self.device,
-            self.weight_dtype,
-            self.whisper,
-            librosa_length,
-            fps=FPS,
-            audio_padding_length_left=AUDIO_PAD_LEFT,
-            audio_padding_length_right=AUDIO_PAD_RIGHT,
-        )
-        video_num = len(whisper_chunks)
-        if video_num == 0:
-            raise RuntimeError("No audio frames extracted (empty/too-short audio?)")
+        has_next_context = bool(next_audio_path and os.path.exists(next_audio_path))
+        ctx_tmp_dir: str | None = None
+        try:
+            if prev_audio_path or next_audio_path:
+                combined_path, frame_offset, own_num_frames, ctx_tmp_dir = self._build_context_audio(
+                    audio_path, prev_audio_path, next_audio_path
+                )
+                whisper_input_features, librosa_length = self.audio_processor.get_audio_feature(
+                    combined_path, weight_dtype=self.weight_dtype
+                )
+                whisper_chunks_full = self.audio_processor.get_whisper_chunk(
+                    whisper_input_features,
+                    self.device,
+                    self.weight_dtype,
+                    self.whisper,
+                    librosa_length,
+                    fps=FPS,
+                    audio_padding_length_left=AUDIO_PAD_LEFT,
+                    audio_padding_length_right=AUDIO_PAD_RIGHT,
+                )
+                # Slice back down to exactly this chunk's own span. The
+                # borrowed neighbour audio only exists to give the boundary
+                # frames real whisper context in place of get_whisper_chunk's
+                # zero-padding — we never want to actually render/hear it.
+                whisper_chunks = whisper_chunks_full[frame_offset:frame_offset + own_num_frames]
+                if 0 < len(whisper_chunks) < own_num_frames:
+                    # The two cumulative-duration floor() calls (frame_offset
+                    # and own_num_frames) can disagree by a single frame;
+                    # pad by repeating the last real frame rather than
+                    # truncating audible content or crashing.
+                    pad = own_num_frames - len(whisper_chunks)
+                    last = whisper_chunks[-1:]
+                    whisper_chunks = torch.cat(
+                        [whisper_chunks, last.expand(pad, *last.shape[1:])], dim=0
+                    )
+            else:
+                whisper_input_features, librosa_length = self.audio_processor.get_audio_feature(
+                    audio_path, weight_dtype=self.weight_dtype
+                )
+                whisper_chunks = self.audio_processor.get_whisper_chunk(
+                    whisper_input_features,
+                    self.device,
+                    self.weight_dtype,
+                    self.whisper,
+                    librosa_length,
+                    fps=FPS,
+                    audio_padding_length_left=AUDIO_PAD_LEFT,
+                    audio_padding_length_right=AUDIO_PAD_RIGHT,
+                )
 
-        # get_whisper_chunk right-pads the whisper feature array with zeros
-        # "to prevent out of bounds" indexing. Each frame's context window is
-        # audio_feature_length_per_frame wide, so the last AUDIO_PAD_RIGHT
-        # frames' windows straddle into that fabricated-silence padding
-        # instead of getting a fully real window like every earlier frame —
-        # that partial-fake context is what shows up as a brief mouth
-        # flutter right as the voice ends. Freeze those frames on the latest
-        # chunk that had a fully real window instead of predicting each from
-        # a partially-fake one. video_num is unchanged, so muxed audio length
-        # (and hence which words are heard) is untouched — only which
-        # whisper features drive the last couple of frames changes.
-        print(f"[musetalk_worker] TAIL_HOLD_FRAMES={TAIL_HOLD_FRAMES}", file=sys.stderr)
-        if TAIL_HOLD_FRAMES > 0 and video_num > TAIL_HOLD_FRAMES:
-            last_good = whisper_chunks[video_num - TAIL_HOLD_FRAMES - 1]
-            whisper_chunks[video_num - TAIL_HOLD_FRAMES:] = last_good.unsqueeze(0).expand(
-                TAIL_HOLD_FRAMES, *last_good.shape
-            )
+            video_num = len(whisper_chunks)
+            if video_num == 0:
+                raise RuntimeError("No audio frames extracted (empty/too-short audio?)")
+
+            # When there was no real next-chunk audio to borrow (the true
+            # last chunk of a reply), fall back to the old mitigation:
+            # get_whisper_chunk right-pads the whisper feature array with
+            # zeros "to prevent out of bounds" indexing, so the last
+            # AUDIO_PAD_RIGHT frames' windows straddle into that fabricated
+            # silence instead of getting a fully real window — freeze those
+            # frames on the latest chunk that had a fully real window
+            # instead of predicting each from a partially-fake one. video_num
+            # is unchanged, so muxed audio length is untouched — only which
+            # whisper features drive the last couple of frames changes.
+            if not has_next_context and TAIL_HOLD_FRAMES > 0 and video_num > TAIL_HOLD_FRAMES:
+                last_good = whisper_chunks[video_num - TAIL_HOLD_FRAMES - 1]
+                whisper_chunks[video_num - TAIL_HOLD_FRAMES:] = last_good.unsqueeze(0).expand(
+                    TAIL_HOLD_FRAMES, *last_good.shape
+                )
+        finally:
+            if ctx_tmp_dir:
+                shutil.rmtree(ctx_tmp_dir, ignore_errors=True)
 
         tmp_dir = tempfile.mkdtemp(prefix="musetalk_")
         try:
@@ -429,7 +532,12 @@ def main() -> None:
             job = json.loads(line)
             t0 = time.time()
             worker.infer(
-                job["image"], job["audio"], job["output"], job.get("coord_cache")
+                job["image"],
+                job["audio"],
+                job["output"],
+                job.get("coord_cache"),
+                job.get("prev_audio"),
+                job.get("next_audio"),
             )
             print(f"[musetalk_worker] job done in {time.time() - t0:.2f}s -> {job['output']}")
             _send({"status": "ok"})
