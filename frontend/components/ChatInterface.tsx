@@ -47,12 +47,6 @@ interface DownloadItem {
   gen: number
 }
 
-// Browsers don't support real reverse video playback (negative playbackRate
-// is a no-op), so the idle/thinking loops are faked by scrubbing currentTime
-// backwards on a rAF loop at real-time pace once the clip reaches its end —
-// a "pendulum" ping-pong. Seeks are throttled to ~30fps so we're not issuing
-// a decoder seek on every animation frame. Ported from test_client.html.
-const PENDULUM_FRAME_INTERVAL = 1 / 30
 // How often to re-poll the avatar record for idle/thinking video URLs while
 // LivePortrait generation is still running in the background after upload.
 const VIDEO_POLL_INTERVAL_MS = 5000
@@ -134,7 +128,10 @@ function TypingIndicator() {
 
 // Idle avatar: shows the avatar image with a breathing + glow animation
 function IdleAvatar({ imageUrl }: { imageUrl: string | null }) {
-  if (!imageUrl) {
+  const [failed, setFailed] = useState(false)
+  useEffect(() => setFailed(false), [imageUrl])
+
+  if (!imageUrl || failed) {
     return (
       <div className="absolute inset-0 flex flex-col items-center justify-center gap-4">
         <div className="w-20 h-20 rounded-full bg-gradient-to-br from-primary-600/30 to-accent-600/20
@@ -159,6 +156,7 @@ function IdleAvatar({ imageUrl }: { imageUrl: string | null }) {
         alt="Avatar idle"
         className="avatar-idle relative z-10 w-full h-full object-contain"
         style={{ borderRadius: '0.75rem' }}
+        onError={() => setFailed(true)}
       />
       {/* Subtle scanline shimmer overlay */}
       <div
@@ -234,6 +232,13 @@ export function ChatInterface({ avatarId, voiceId, resumeSessionId, onSessionCre
   const [currentChunkProgress, setCurrentChunkProgress] = useState({ current: 0, total: 0 })
   const [idleVideoUrl, setIdleVideoUrl] = useState<string | null>(null)
   const [thinkingVideoUrl, setThinkingVideoUrl] = useState<string | null>(null)
+  // Reversed companions (ffmpeg -vf reverse, generated server-side alongside
+  // the forward clips) — optional. When present, playLoop() ping-pongs
+  // between the forward and reversed elements (both played natively forward,
+  // no seeking). When absent (older avatars, or reversal failed server-side)
+  // it falls back to a plain forward loop on videoIdleRef alone.
+  const [idleReversedVideoUrl, setIdleReversedVideoUrl] = useState<string | null>(null)
+  const [thinkingReversedVideoUrl, setThinkingReversedVideoUrl] = useState<string | null>(null)
 
   // ── Frame Scheduler (canvas-based, client-side) ─────────────────────────
   // The three <video> elements below (idle/thinking, chunk A, chunk B) are
@@ -261,6 +266,9 @@ export function ChatInterface({ avatarId, voiceId, resumeSessionId, onSessionCre
   // resource entirely — there is no longer any DOM node the two systems can
   // fight over.
   const videoIdleRef = useRef<HTMLVideoElement>(null)
+  // Only loaded/used when a reversed companion clip exists for the current
+  // loop mode — see playLoop(). Otherwise sits inert.
+  const videoIdleRevRef = useRef<HTMLVideoElement>(null)
   const videoARef = useRef<HTMLVideoElement>(null)
   const videoBRef = useRef<HTMLVideoElement>(null)
   // Which of videoA/videoB currently holds "the chunk in front" for
@@ -288,6 +296,8 @@ export function ChatInterface({ avatarId, voiceId, resumeSessionId, onSessionCre
   const streamEndedRef = useRef(false)    // server sent video_chunk_end for the current turn
   const idleUrlRef = useRef<string | null>(null)
   const thinkingUrlRef = useRef<string | null>(null)
+  const idleReversedUrlRef = useRef<string | null>(null)
+  const thinkingReversedUrlRef = useRef<string | null>(null)
   const isMutedRef = useRef(false)
 
   // ── Text/animation sync ──────────────────────────────────────────────────
@@ -299,13 +309,6 @@ export function ChatInterface({ avatarId, voiceId, resumeSessionId, onSessionCre
   const pendingTextRef = useRef('')                 // all tokens accumulated so far this turn
   const finalMessageRef = useRef<string | null>(null) // full text once the LLM is done, held if animation hasn't started
   const firstChunkPlayedRef = useRef(false)         // true once this turn's first chunk has actually started playing
-
-  // Pendulum (ping-pong) reverse playback for idle/thinking loops.
-  const pendulumElRef = useRef<HTMLVideoElement | null>(null)
-  const pendulumReversingRef = useRef(false)
-  const pendulumRafRef = useRef<number | null>(null)
-  const pendulumLastTsRef = useRef<number | null>(null)
-  const pendulumAccumRef = useRef(0)
 
   const mediaRecorderRef = useRef<MediaRecorder | null>(null)
   const messagesEndRef = useRef<HTMLDivElement>(null)
@@ -331,6 +334,8 @@ export function ChatInterface({ avatarId, voiceId, resumeSessionId, onSessionCre
           setAvatarImageUrl(av.thumbnail_url || av.image_url || null)
           setIdleVideoUrl(av.idle_video_url || null)
           setThinkingVideoUrl(av.thinking_video_url || null)
+          setIdleReversedVideoUrl(av.idle_video_reversed_url || null)
+          setThinkingReversedVideoUrl(av.thinking_video_reversed_url || null)
           attempts += 1
           const stillMissing = !av.idle_video_url && !av.thinking_video_url
           if (stillMissing && attempts < VIDEO_POLL_MAX_ATTEMPTS) {
@@ -346,64 +351,6 @@ export function ChatInterface({ avatarId, voiceId, resumeSessionId, onSessionCre
 
   function activeVideoEl() { return activeIdxRef.current === 0 ? videoARef.current : videoBRef.current }
   function standbyVideoEl() { return activeIdxRef.current === 0 ? videoBRef.current : videoARef.current }
-
-  function stopPendulum() {
-    if (pendulumRafRef.current) cancelAnimationFrame(pendulumRafRef.current)
-    pendulumElRef.current = null
-    pendulumReversingRef.current = false
-    pendulumRafRef.current = null
-    pendulumLastTsRef.current = null
-    pendulumAccumRef.current = 0
-  }
-
-  function startPendulum(el: HTMLVideoElement) {
-    stopPendulum()
-    pendulumElRef.current = el
-    el.loop = false
-    if (el.currentTime !== 0) el.currentTime = 0
-    el.play().catch(() => {})
-  }
-
-  function resumePendulumOrPlay(el: HTMLVideoElement) {
-    if (pendulumElRef.current === el) {
-      if (pendulumReversingRef.current) return
-      if (el.paused) el.play().catch(() => {})
-      return
-    }
-    startPendulum(el)
-  }
-
-  function beginPendulumReverse(el: HTMLVideoElement) {
-    if (el !== pendulumElRef.current) return
-    pendulumReversingRef.current = true
-    pendulumLastTsRef.current = null
-    pendulumAccumRef.current = 0
-    el.pause()
-    pendulumRafRef.current = requestAnimationFrame(pendulumStep)
-  }
-
-  function pendulumStep(ts: number) {
-    const v = pendulumElRef.current
-    if (!v) return
-    if (pendulumLastTsRef.current == null) pendulumLastTsRef.current = ts
-    const dt = (ts - pendulumLastTsRef.current) / 1000
-    pendulumLastTsRef.current = ts
-    pendulumAccumRef.current += dt
-    if (pendulumAccumRef.current >= PENDULUM_FRAME_INTERVAL) {
-      const step = pendulumAccumRef.current
-      pendulumAccumRef.current = 0
-      const t = v.currentTime - step
-      if (t <= 0.001) {
-        v.currentTime = 0
-        pendulumReversingRef.current = false
-        pendulumRafRef.current = null
-        v.play().catch(() => {})
-        return
-      }
-      v.currentTime = t
-    }
-    pendulumRafRef.current = requestAnimationFrame(pendulumStep)
-  }
 
   // Reveals `el` only once a real decoded frame has actually been painted,
   // not merely once the browser signals enough data is buffered ('canplay'/
@@ -478,9 +425,8 @@ export function ChatInterface({ avatarId, voiceId, resumeSessionId, onSessionCre
   // at (cross-dissolving over FRAME_SCHEDULER_FADE_MS when it just changed)
   // onto the visible canvas every frame. Deliberately never clears the
   // canvas before confirming it has something new to draw — if a source
-  // momentarily lacks a decoded frame (e.g. mid-seek during the idle
-  // pendulum scrub), the canvas simply keeps showing its last-drawn pixels
-  // instead of flashing to black.
+  // momentarily lacks a decoded frame, the canvas simply keeps showing its
+  // last-drawn pixels instead of flashing to black.
   useEffect(() => {
     const canvas = canvasRef.current
     if (!canvas) return
@@ -607,41 +553,92 @@ export function ChatInterface({ avatarId, voiceId, resumeSessionId, onSessionCre
     standby.load()
   }
 
-  // Decide which loop applies right now: idle, or thinking (falls back to idle).
-  function currentLoop(): { src: string | null; mode: 'idle' | 'thinking' } {
-    if (isRespondingRef.current) return { src: thinkingUrlRef.current || idleUrlRef.current, mode: 'thinking' }
-    return { src: idleUrlRef.current, mode: 'idle' }
+  // Decide which loop applies right now: idle, or thinking (falls back to
+  // idle). reversedSrc always corresponds to whichever src was actually
+  // picked — null when no reversed companion exists for that clip.
+  function currentLoop(): { src: string | null; reversedSrc: string | null; mode: 'idle' | 'thinking' } {
+    if (isRespondingRef.current) {
+      if (thinkingUrlRef.current) {
+        return { src: thinkingUrlRef.current, reversedSrc: thinkingReversedUrlRef.current, mode: 'thinking' }
+      }
+      return { src: idleUrlRef.current, reversedSrc: idleReversedUrlRef.current, mode: 'thinking' }
+    }
+    return { src: idleUrlRef.current, reversedSrc: idleReversedUrlRef.current, mode: 'idle' }
   }
 
-  // Manages ONLY the dedicated idle/thinking element — entirely independent
+  // Manages ONLY the dedicated idle/thinking elements — entirely independent
   // of the chunk-pair cross-fade in transitionTo(). Always safe to call:
   // there's no shared standby slot here for a chunk transition to race.
   // `immediate` skips the cross-dissolve for a snap-cut back to idle — used
   // by resetPlayback() on barge-in, where a lingering fade to whatever chunk
   // was just cut off would look like a stutter, not a clean interrupt.
+  //
+  // When a reversed companion clip exists, this ping-pongs between videoIdleRef
+  // (forward) and videoIdleRevRef (reversed) — both played natively forward,
+  // never seeked — via the 'ended' handlers wired in the mount effect below.
+  // Real reverse video playback isn't supported by browsers, and manually
+  // scrubbing currentTime backwards on compressed video is slow/unreliable
+  // (each step re-decodes from the nearest prior keyframe) — that used to
+  // make the idle loop visibly stall at the end of every cycle. Without a
+  // reversed companion (older avatars, or server-side reversal failed) this
+  // just falls back to a plain forward loop on videoIdleRef alone.
   function playLoop(opts: { immediate?: boolean } = {}) {
     const { immediate = false } = opts
-    const { src, mode } = currentLoop()
+    const { src, reversedSrc, mode } = currentLoop()
     setLoopMode(mode)
-    const idleEl = videoIdleRef.current
-    if (!idleEl || !src) { setIsSpeaking(false); return } // nothing generated yet — placeholder stays up
-    if (idleEl.src === src) {
-      idleEl.dataset.mode = mode
-      resumePendulumOrPlay(idleEl)
-      switchTo(idleEl, { fade: !immediate })
+    const fwdEl = videoIdleRef.current
+    const revEl = videoIdleRevRef.current
+    if (!fwdEl || !src) { setIsSpeaking(false); return } // nothing generated yet — placeholder stays up
+
+    if (!reversedSrc || !revEl) {
+      fwdEl.loop = true
+      fwdEl.muted = true
+      fwdEl.dataset.mode = mode
+      if (fwdEl.src === src) {
+        if (fwdEl.paused) fwdEl.play().catch(() => {})
+        switchTo(fwdEl, { fade: !immediate })
+        return
+      }
+      const onReady = () => {
+        fwdEl.removeEventListener('canplay', onReady)
+        fwdEl.play().catch(() => {})
+        switchTo(fwdEl, { fade: !immediate })
+      }
+      fwdEl.addEventListener('canplay', onReady, { once: true })
+      fwdEl.src = src
+      fwdEl.load()
       return
     }
-    idleEl.loop = false
-    idleEl.muted = true
-    idleEl.dataset.mode = mode
-    const onReady = () => {
-      idleEl.removeEventListener('canplay', onReady)
-      startPendulum(idleEl)
-      switchTo(idleEl, { fade: !immediate })
+
+    fwdEl.loop = false
+    fwdEl.muted = true
+    fwdEl.dataset.mode = mode
+    revEl.loop = false
+    revEl.muted = true
+    revEl.dataset.mode = mode
+
+    if (fwdEl.src === src && revEl.src === reversedSrc) {
+      if (fwdEl.paused && revEl.paused) { fwdEl.currentTime = 0; fwdEl.play().catch(() => {}) }
+      switchTo(fwdEl, { fade: !immediate })
+      return
     }
-    idleEl.addEventListener('canplay', onReady, { once: true })
-    idleEl.src = src
-    idleEl.load()
+
+    let readyCount = 0
+    const tryStart = () => {
+      readyCount++
+      if (readyCount < 2) return
+      fwdEl.currentTime = 0
+      fwdEl.play().catch(() => {})
+      switchTo(fwdEl, { fade: !immediate })
+    }
+    const onFwdReady = () => { fwdEl.removeEventListener('canplay', onFwdReady); tryStart() }
+    const onRevReady = () => { revEl.removeEventListener('canplay', onRevReady); tryStart() }
+    fwdEl.addEventListener('canplay', onFwdReady, { once: true })
+    revEl.addEventListener('canplay', onRevReady, { once: true })
+    fwdEl.src = src
+    fwdEl.load()
+    revEl.src = reversedSrc
+    revEl.load()
   }
 
   // While a chunk is playing, silently load the next queued chunk into the
@@ -845,7 +842,6 @@ export function ChatInterface({ avatarId, voiceId, resumeSessionId, onSessionCre
     pendingChunkTransitionRef.current = false
     swapTokenRef.current++
     isPlayingChunkRef.current = false
-    stopPendulum()
     // The turn this buffered/held text belonged to is being torn down —
     // don't let it leak into whatever turn starts next.
     pendingTextRef.current = ''
@@ -876,8 +872,8 @@ export function ChatInterface({ avatarId, voiceId, resumeSessionId, onSessionCre
   // and stable setState identities, so a stale render closure is harmless —
   // functionally identical to test_client.html's one-shot IIFE wiring.
   // Split in two: the A/B pair only ever hosts reply chunks now (mode is
-  // always 'chunk:N'), and the idle/thinking loop's pendulum-reverse-at-end
-  // logic lives entirely on its own dedicated element.
+  // always 'chunk:N'), and the idle/thinking loop plays on its own native
+  // `loop = true` element (see playLoop()) with no extra wiring needed here.
   useEffect(() => {
     // Deliberately does NOT setIsSpeaking(false) here. That used to fire the
     // instant a chunk ended regardless of whether the next one was ready,
@@ -915,15 +911,8 @@ export function ChatInterface({ avatarId, voiceId, resumeSessionId, onSessionCre
       // idle loop the instant this fires.
       tryPlayNext()
     }
-    const onIdleEnded = () => {
-      const el = videoIdleRef.current
-      if (el && el === pendulumElRef.current && !pendulumReversingRef.current) {
-        beginPendulumReverse(el)
-      }
-    }
     const a = videoARef.current
     const b = videoBRef.current
-    const idleEl = videoIdleRef.current
     const onEndedA = onChunkEndedFactory(a)
     const onEndedB = onChunkEndedFactory(b)
     const onErrorA = onChunkErrorFactory(a)
@@ -932,24 +921,61 @@ export function ChatInterface({ avatarId, voiceId, resumeSessionId, onSessionCre
     a?.addEventListener('error', onErrorA)
     b?.addEventListener('ended', onEndedB)
     b?.addEventListener('error', onErrorB)
-    idleEl?.addEventListener('ended', onIdleEnded)
+
+    // Idle/thinking ping-pong: when a reversed companion is in play (see
+    // playLoop()), the forward and reversed elements hand off to each other
+    // on 'ended' — both play natively forward, so this never fires when
+    // there's no reversed companion (that case uses native loop=true, which
+    // never emits 'ended'). Guarded on frontElRef so a stale 'ended' from an
+    // element that already got superseded (e.g. resetPlayback mid-swap)
+    // can't restart a hand-off nothing else is expecting.
+    const onIdleLoopEndedFactory = (el: HTMLVideoElement | null, other: HTMLVideoElement | null) => () => {
+      if (!el || el !== frontElRef.current || !other) return
+      other.currentTime = 0
+      other.play().catch(() => {})
+      switchTo(other, { fade: true })
+    }
+    const idleFwd = videoIdleRef.current
+    const idleRev = videoIdleRevRef.current
+    const onIdleFwdEnded = onIdleLoopEndedFactory(idleFwd, idleRev)
+    const onIdleRevEnded = onIdleLoopEndedFactory(idleRev, idleFwd)
+    idleFwd?.addEventListener('ended', onIdleFwdEnded)
+    idleRev?.addEventListener('ended', onIdleRevEnded)
+
     return () => {
       a?.removeEventListener('ended', onEndedA)
       a?.removeEventListener('error', onErrorA)
       b?.removeEventListener('ended', onEndedB)
       b?.removeEventListener('error', onErrorB)
-      idleEl?.removeEventListener('ended', onIdleEnded)
+      idleFwd?.removeEventListener('ended', onIdleFwdEnded)
+      idleRev?.removeEventListener('ended', onIdleRevEnded)
     }
   // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [])
+
+  // Resume the idle/thinking loop if a backgrounded tab left it paused —
+  // some browsers pause offscreen <video> elements after a while even with
+  // loop=true set.
+  useEffect(() => {
+    const onVisibility = () => {
+      if (document.hidden) return
+      if (isPlayingChunkRef.current) return // a real chunk owns the screen — not our concern
+      const el = videoIdleRef.current
+      if (el && el.paused && el.src) el.play().catch(() => {})
+    }
+    document.addEventListener('visibilitychange', onVisibility)
+    return () => document.removeEventListener('visibilitychange', onVisibility)
   }, [])
 
   // Sync idle/thinking URLs into refs and (re)apply once they load in.
   useEffect(() => {
     idleUrlRef.current = idleVideoUrl
     thinkingUrlRef.current = thinkingVideoUrl
+    idleReversedUrlRef.current = idleReversedVideoUrl
+    thinkingReversedUrlRef.current = thinkingReversedVideoUrl
     if (!isPlayingChunkRef.current) playLoop()
   // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [idleVideoUrl, thinkingVideoUrl])
+  }, [idleVideoUrl, thinkingVideoUrl, idleReversedVideoUrl, thinkingReversedVideoUrl])
 
   // Sync muted state to refs + whichever chunk is currently active (loops stay muted always).
   useEffect(() => {
@@ -1441,11 +1467,12 @@ export function ChatInterface({ avatarId, voiceId, resumeSessionId, onSessionCre
 
       // Release media resources so navigating away mid-playback/recording
       // doesn't leak: still-playing <video> elements, an open AudioContext,
-      // and running rAF loops (playback + pendulum) all survive unmount otherwise.
+      // and the render-loop rAF all survive unmount otherwise.
       const videoA = videoARef.current
       const videoB = videoBRef.current
       const videoIdle = videoIdleRef.current
-      ;[videoA, videoB, videoIdle].forEach((video) => {
+      const videoIdleRev = videoIdleRevRef.current
+      ;[videoA, videoB, videoIdle, videoIdleRev].forEach((video) => {
         if (!video) return
         video.pause()
         if (video.dataset.objectUrl) URL.revokeObjectURL(video.dataset.objectUrl)
@@ -1454,7 +1481,6 @@ export function ChatInterface({ avatarId, voiceId, resumeSessionId, onSessionCre
       })
       playQueueRef.current.forEach((item) => URL.revokeObjectURL(item.url))
       playQueueRef.current = []
-      stopPendulum()
       if (levelAnimRef.current !== null) cancelAnimationFrame(levelAnimRef.current)
       if (audioContextRef.current && audioContextRef.current.state !== 'closed') {
         audioContextRef.current.close().catch(() => {})
@@ -1509,6 +1535,7 @@ export function ChatInterface({ avatarId, voiceId, resumeSessionId, onSessionCre
               style={{ opacity: showPlaceholder ? 0 : 1, zIndex: 4 }}
             />
             <video ref={videoIdleRef} className="absolute inset-0 w-full h-full opacity-0 pointer-events-none" playsInline />
+            <video ref={videoIdleRevRef} className="absolute inset-0 w-full h-full opacity-0 pointer-events-none" playsInline />
             <video ref={videoARef} className="absolute inset-0 w-full h-full opacity-0 pointer-events-none" playsInline />
             <video ref={videoBRef} className="absolute inset-0 w-full h-full opacity-0 pointer-events-none" playsInline />
 

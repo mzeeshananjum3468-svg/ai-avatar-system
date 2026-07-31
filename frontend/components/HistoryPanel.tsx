@@ -58,6 +58,7 @@ export function HistoryPanel({ onResume }: HistoryPanelProps) {
   const [renameValue, setRenameValue] = useState('')
   const [busy, setBusy] = useState<string | null>(null)
   const [summarizingId, setSummarizingId] = useState<string | null>(null)
+  const [failedThumbIds, setFailedThumbIds] = useState<Set<string>>(new Set())
 
   const { data: sessions, isLoading, refetch } = useQuery<SessionSummary[]>({
     queryKey: ['sessions'],
@@ -256,12 +257,13 @@ export function HistoryPanel({ onResume }: HistoryPanelProps) {
               <div key={s.id} className="glass-card rounded-2xl overflow-hidden border border-white/8">
                 <div className="flex items-center gap-4 px-5 py-4">
                   <div className="w-12 h-12 rounded-xl overflow-hidden bg-surface-700 flex-shrink-0 flex items-center justify-center">
-                    {av?.thumbnail_url || av?.image_url ? (
+                    {(av?.thumbnail_url || av?.image_url) && !failedThumbIds.has(s.avatar_id) ? (
                       // eslint-disable-next-line @next/next/no-img-element
                       <img
                         src={av.thumbnail_url || av.image_url}
                         alt={av.name}
                         className="w-full h-full object-cover"
+                        onError={() => setFailedThumbIds((prev) => new Set(prev).add(s.avatar_id))}
                       />
                     ) : (
                       <MessageCircle size={20} className="text-gray-500" />

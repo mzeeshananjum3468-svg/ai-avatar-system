@@ -37,7 +37,9 @@ export function AvatarList({ selectedAvatar, onSelectAvatar }: AvatarListProps) 
   const [editingId, setEditingId] = useState<string | null>(null)
   const [draftPrompt, setDraftPrompt] = useState('')
   const [draftName, setDraftName] = useState('')
+  const [draftBboxShift, setDraftBboxShift] = useState(0)
   const [isSaving, setIsSaving] = useState(false)
+  const [failedThumbIds, setFailedThumbIds] = useState<Set<string>>(new Set())
 
   const { data: avatars, isLoading, refetch } = useQuery({
     queryKey: ['avatars'],
@@ -66,6 +68,7 @@ export function AvatarList({ selectedAvatar, onSelectAvatar }: AvatarListProps) 
   const openEditor = (avatar: Avatar) => {
     setDraftPrompt(avatar.avatar_metadata?.system_prompt ?? '')
     setDraftName(avatar.name ?? '')
+    setDraftBboxShift(avatar.avatar_metadata?.bbox_shift ?? 0)
     setEditingId(avatar.id)
   }
 
@@ -74,7 +77,10 @@ export function AvatarList({ selectedAvatar, onSelectAvatar }: AvatarListProps) 
     try {
       const av = avatars?.find((a: Avatar) => a.id === avatarId)
       const saves: Promise<void>[] = [
-        api.setAvatarMetadata(avatarId, { system_prompt: draftPrompt.trim() }),
+        api.setAvatarMetadata(avatarId, {
+          system_prompt: draftPrompt.trim(),
+          bbox_shift: draftBboxShift,
+        }),
       ]
       if (draftName.trim() && draftName.trim() !== av?.name) {
         saves.push(api.renameAvatar(avatarId, draftName.trim()))
@@ -141,12 +147,13 @@ export function AvatarList({ selectedAvatar, onSelectAvatar }: AvatarListProps) 
                 >
                   {/* Image */}
                   <div className="aspect-[3/4] relative bg-surface-700 overflow-hidden">
-                    {(avatar.thumbnail_url || avatar.image_url) ? (
+                    {(avatar.thumbnail_url || avatar.image_url) && !failedThumbIds.has(avatar.id) ? (
                       <Image
                         src={(avatar.thumbnail_url || avatar.image_url) as string}
                         alt={avatar.name}
                         fill
                         className="object-contain transition-transform duration-500 group-hover:scale-105"
+                        onError={() => setFailedThumbIds((prev) => new Set(prev).add(avatar.id))}
                       />
                     ) : (
                       <div className="w-full h-full flex items-center justify-center">
@@ -290,6 +297,27 @@ export function AvatarList({ selectedAvatar, onSelectAvatar }: AvatarListProps) 
                              placeholder:text-gray-600 focus:outline-none focus:ring-2 focus:ring-primary-500/50
                              focus:border-primary-500/40 resize-none transition-all duration-200"
                 />
+
+                <div className="mt-3 space-y-1.5">
+                  <div className="flex items-center justify-between">
+                    <label className="text-xs font-medium text-gray-400">Face crop shift (bbox_shift)</label>
+                    <span className="text-xs text-primary-400 font-mono">{draftBboxShift}</span>
+                  </div>
+                  <input
+                    type="range"
+                    min={-9}
+                    max={9}
+                    step={1}
+                    value={draftBboxShift}
+                    onChange={(e) => setDraftBboxShift(Number(e.target.value))}
+                    className="w-full accent-primary-500"
+                  />
+                  <p className="text-[11px] text-gray-500">
+                    Adjusts how much chin/jaw MuseTalk includes in the animated region. There&apos;s no
+                    automatically &quot;correct&quot; value — nudge it and check a reply until the mouth/jaw
+                    look natural.
+                  </p>
+                </div>
 
                 <div className="flex items-center justify-between mt-3">
                   <span className="text-xs text-gray-600">{draftPrompt.length} chars</span>

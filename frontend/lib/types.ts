@@ -6,6 +6,8 @@ export interface Avatar {
   image_url?: string
   idle_video_url?: string | null
   thinking_video_url?: string | null
+  idle_video_reversed_url?: string | null
+  thinking_video_reversed_url?: string | null
   s3_key?: string
   voice_id?: string | null
   avatar_metadata?: {
@@ -13,6 +15,7 @@ export interface Avatar {
     personality?: string
     background_color?: string
     animation_style?: string
+    bbox_shift?: number
   }
   created_at?: string
 }
