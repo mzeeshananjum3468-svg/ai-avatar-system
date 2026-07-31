@@ -60,6 +60,11 @@ class Avatar(Base):
     # configured or generation errors out.
     idle_video_url = Column(String, nullable=True)
     thinking_video_url = Column(String, nullable=True)
+    # Reversed companion clips (ffmpeg -vf reverse) — lets the client ping-pong
+    # between two natively-forward-playing elements instead of seeking a
+    # single video backwards, which is slow/unreliable on compressed video.
+    idle_video_reversed_url = Column(String, nullable=True)
+    thinking_video_reversed_url = Column(String, nullable=True)
     status = Column(String, default="processing")  # processing, ready, failed
     voice_id = Column(
         String, nullable=True, index=True

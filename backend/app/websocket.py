@@ -168,6 +168,7 @@ class ConnectionManager:
             "voice_wav": None,
             "language": "en",
             "system_prompt": None,
+            "bbox_shift": 0,
             "user_id": user_id,
             "connected_at": datetime.now(timezone.utc),
             "last_activity": datetime.now(timezone.utc),
@@ -198,8 +199,9 @@ class ConnectionManager:
         if avatar_image:
             voice_wav = self.session_data[session_id].get("voice_wav")
             language = self.session_data[session_id].get("language", "en")
+            bbox_shift = self.session_data[session_id].get("bbox_shift", 0)
             await asyncio.gather(
-                avatar_animator.warmup_avatar(avatar_image),
+                avatar_animator.warmup_avatar(avatar_image, bbox_shift=bbox_shift),
                 tts_service.warmup(voice_wav, language),
             )
         await self.send_message(session_id, {"type": "session_ready"})
@@ -270,6 +272,10 @@ class ConnectionManager:
                     if sp:
                         self.session_data[session_id]["system_prompt"] = sp
                         logger.info(f"Loaded system prompt for avatar {avatar.id}")
+
+                    bbox_shift = meta.get("bbox_shift")
+                    if isinstance(bbox_shift, int):
+                        self.session_data[session_id]["bbox_shift"] = bbox_shift
 
                     if avatar.voice_id:
                         wav = await self._get_voice_wav_path(avatar.voice_id)
@@ -743,6 +749,7 @@ class ConnectionManager:
         avatar_image = data.get("avatar_image_local")
         speaker_wav: Optional[str] = data.get("voice_wav")
         language: str = data.get("language", "en")
+        bbox_shift: int = data.get("bbox_shift", 0)
 
         # If no avatar image, drain queue silently
         if not avatar_image:
@@ -824,6 +831,7 @@ class ConnectionManager:
                         avatar_image_path=avatar_image,
                         audio_path=str(tmp_audio),
                         output_path=str(tmp_video),
+                        bbox_shift=bbox_shift,
                     )
 
                 ts = int(datetime.now(timezone.utc).timestamp() * 1000)

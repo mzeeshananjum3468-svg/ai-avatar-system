@@ -181,18 +181,41 @@ class LivePortraitService:
         if proc.returncode != 0:
             raise RuntimeError(f"ffmpeg mute failed for {src}:\n{stderr.decode(errors='replace')[-2000:]}")
 
+    async def _reverse(self, src: Path, dest: Path) -> None:
+        """Frame-reverse `src` into `dest`. Unlike _mute this can't stream-copy
+        (reversing requires decoding the whole clip), but these are ~10s loop
+        videos generated once at upload time, not a per-request cost.
+
+        The client plays this forward-only, alternating it with the original
+        clip on each 'ended' — real reverse video playback isn't supported by
+        browsers (negative playbackRate is a no-op), and scrubbing `currentTime`
+        backwards on compressed video is slow/unreliable (each step re-decodes
+        from the nearest prior keyframe), which is what this file exists to
+        avoid on the client.
+        """
+        cmd = ["ffmpeg", "-y", "-i", str(src), "-vf", "reverse", "-an", str(dest)]
+        proc = await asyncio.create_subprocess_exec(
+            *cmd, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE
+        )
+        _, stderr = await proc.communicate()
+        if proc.returncode != 0:
+            raise RuntimeError(f"ffmpeg reverse failed for {src}:\n{stderr.decode(errors='replace')[-2000:]}")
+
     async def generate_idle_and_thinking(
         self, source_image_path: str, avatar_id: str
-    ) -> Tuple[Optional[str], Optional[str]]:
-        """Generate silent idle-loop and thinking-loop videos for an avatar.
+    ) -> Tuple[Optional[str], Optional[str], Optional[str], Optional[str]]:
+        """Generate silent idle-loop and thinking-loop videos for an avatar,
+        plus a frame-reversed companion of each.
 
-        Returns (idle_video_path, thinking_video_path) — either (or both) may
-        be None if LivePortrait isn't installed/configured or inference fails;
-        callers must treat these as optional and leave the avatar usable
-        without them.
+        Returns (idle_video_path, idle_reversed_path, thinking_video_path,
+        thinking_reversed_path) — any of these may be None if LivePortrait
+        isn't installed/configured or inference fails; callers must treat
+        every value as optional and leave the avatar usable without them (the
+        reversed pair especially — the client falls back to a plain forward
+        loop when they're missing).
         """
         if not self.available:
-            return None, None
+            return None, None, None, None
 
         work_dir = TMPDIR / f"liveportrait-{avatar_id}-{uuid.uuid4().hex[:8]}"
         try:
@@ -211,10 +234,28 @@ class LivePortraitService:
             await self._mute(idle_raw, idle_out)
             await self._mute(thinking_raw, thinking_out)
 
-            return str(idle_out), str(thinking_out)
+            idle_reversed_out = TMPDIR / f"{avatar_id}_idle_reversed.mp4"
+            thinking_reversed_out = TMPDIR / f"{avatar_id}_thinking_reversed.mp4"
+            try:
+                await self._reverse(idle_out, idle_reversed_out)
+            except Exception:
+                logger.exception(f"Reversed idle clip failed for avatar {avatar_id} — continuing without it")
+                idle_reversed_out = None
+            try:
+                await self._reverse(thinking_out, thinking_reversed_out)
+            except Exception:
+                logger.exception(f"Reversed thinking clip failed for avatar {avatar_id} — continuing without it")
+                thinking_reversed_out = None
+
+            return (
+                str(idle_out),
+                str(idle_reversed_out) if idle_reversed_out else None,
+                str(thinking_out),
+                str(thinking_reversed_out) if thinking_reversed_out else None,
+            )
         except Exception:
             logger.exception(f"LivePortrait idle/thinking generation failed for avatar {avatar_id}")
-            return None, None
+            return None, None, None, None
         finally:
             shutil.rmtree(work_dir, ignore_errors=True)
 

@@ -212,7 +212,12 @@ class AvatarAnimator:
             pass
 
     async def _worker_infer(
-        self, image_path: str, audio_path: str, output_path: str, coord_cache: Optional[str]
+        self,
+        image_path: str,
+        audio_path: str,
+        output_path: str,
+        coord_cache: Optional[str],
+        bbox_shift: int = 0,
     ) -> str:
         """Send one job to the persistent worker and await its result."""
         async with self._worker_lock:
@@ -225,6 +230,7 @@ class AvatarAnimator:
                         "audio": str(Path(audio_path).resolve()),
                         "output": str(Path(output_path).resolve()),
                         "coord_cache": coord_cache,
+                        "bbox_shift": bbox_shift,
                     }
                 )
                 + "\n"
@@ -315,7 +321,7 @@ class AvatarAnimator:
         if proc.returncode != 0:
             raise RuntimeError(f"Could not generate warmup silence: {stderr.decode(errors='replace')}")
 
-    async def warmup_avatar(self, avatar_image_path: str) -> None:
+    async def warmup_avatar(self, avatar_image_path: str, bbox_shift: int = 0) -> None:
         """
         Run one throwaway inference for this specific avatar: loads the
         worker if it isn't already up, computes/caches this avatar's face
@@ -323,6 +329,12 @@ class AvatarAnimator:
         otherwise pay lazily on the first real turn), and warms the CUDA
         kernels for this crop shape. Called from the WS connect path so a
         session's first REAL message doesn't eat this latency.
+
+        `bbox_shift` is the avatar's saved manual crop-adjustment value (see
+        AvatarMetadataUpdate.bbox_shift) — passing it here means the cache
+        warmup produces is already built for the value the avatar will
+        actually be animated with, instead of always priming a bbox_shift=0
+        cache that the first real turn then has to recompute.
 
         Best-effort — swallows all errors so a broken/missing avatar image
         can't block a session from ever starting; the real `animate()` call
@@ -337,7 +349,9 @@ class AvatarAnimator:
         dummy_output = TMPDIR / f"warmup-{uuid.uuid4().hex}.mp4"
         try:
             await self._write_silence(dummy_audio, seconds=1.0)
-            await self._animate_musetalk(avatar_image_path, str(dummy_audio), str(dummy_output))
+            await self._animate_musetalk(
+                avatar_image_path, str(dummy_audio), str(dummy_output), bbox_shift=bbox_shift
+            )
             logger.info(f"Avatar warmup complete: {avatar_image_path}")
         except Exception:
             logger.exception(f"Avatar warmup failed for {avatar_image_path} — continuing anyway")
@@ -353,6 +367,7 @@ class AvatarAnimator:
         audio_path: str,
         output_path: str,
         cache_key: Optional[str] = None,
+        bbox_shift: int = 0,
     ) -> str:
         """
         Animate avatar with audio. Returns path to the generated video.
@@ -371,7 +386,9 @@ class AvatarAnimator:
                 # frame (see musetalk_worker.py). Extracting a single frame
                 # here would silently downgrade every video avatar to a
                 # still-image lip-sync, which defeats the point.
-                return await self._animate_musetalk(avatar_image_path, audio_path, output_path)
+                return await self._animate_musetalk(
+                    avatar_image_path, audio_path, output_path, bbox_shift=bbox_shift
+                )
             else:
                 return await self._animate_simple_from_source(avatar_image_path, audio_path, output_path)
         except Exception:
@@ -435,25 +452,26 @@ class AvatarAnimator:
         avatar_path: str,
         audio_path: str,
         output_path: str,
+        bbox_shift: int = 0,
     ) -> str:
         """Run MuseTalk via persistent worker (models stay loaded between calls)."""
         musetalk_dir: Path = self._musetalk_dir  # type: ignore[assignment]
 
-        # Per-avatar face-coordinate cache (saves face-detection on repeat calls)
+        # Per-avatar face-coordinate cache (saves face-detection + latent
+        # encoding on repeat calls). Co-located next to the avatar's own
+        # source file — for local storage that's inside
+        # uploads/avatars/<avatar_id>/ — so warmup's cache survives to serve
+        # every later real request for that avatar, persists across
+        # redeploys, and gets cleaned up alongside the avatar's other files
+        # (see delete_avatar) instead of living inside the MuseTalk checkout.
         source_path = Path(avatar_path)
-        source_bytes = source_path.read_bytes() if source_path.exists() else b""
-        avatar_id = hashlib.md5(source_bytes).hexdigest()
-        coord_cache = str(musetalk_dir / "results" / "coords" / f"{avatar_id}.pkl")
+        if source_path.exists():
+            coord_cache = f"{source_path}.musetalk_cache.pkl"
+        else:
+            coord_cache = str(musetalk_dir / "results" / "coords" / f"{uuid.uuid4().hex}.pkl")
         os.makedirs(os.path.dirname(coord_cache), exist_ok=True)
 
-        # If the path changed but the content is different, don't reuse a stale
-        # cache generated from an older still frame / video frame.
-        if source_path.exists() and source_path.suffix.lower() in {".jpg", ".jpeg", ".png", ".webp"}:
-            legacy_cache = musetalk_dir / "results" / "coords" / f"{hashlib.md5(str(source_path.resolve()).encode()).hexdigest()}.pkl"
-            if legacy_cache.exists() and not Path(coord_cache).exists():
-                legacy_cache.unlink(missing_ok=True)
-
-        await self._worker_infer(avatar_path, audio_path, output_path, coord_cache)
+        await self._worker_infer(avatar_path, audio_path, output_path, coord_cache, bbox_shift=bbox_shift)
 
         logger.info(f"MuseTalk animation done: {output_path}")
         return output_path

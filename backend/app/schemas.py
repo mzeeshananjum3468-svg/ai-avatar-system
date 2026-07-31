@@ -42,6 +42,8 @@ class AvatarResponse(AvatarBase):
     thumbnail_url: Optional[str] = None
     idle_video_url: Optional[str] = None
     thinking_video_url: Optional[str] = None
+    idle_video_reversed_url: Optional[str] = None
+    thinking_video_reversed_url: Optional[str] = None
     status: str
     voice_id: Optional[str] = None
     avatar_metadata: Optional[Dict[str, Any]] = Field(None, alias="avatar_metadata")
@@ -119,6 +121,10 @@ class AvatarMetadataUpdate(BaseModel):
     personality: Optional[str] = Field(default=None, max_length=2000)
     background_color: Optional[str] = Field(default=None, max_length=32)
     animation_style: Optional[str] = Field(default=None, max_length=32)
+    # MuseTalk's manual face-crop tuning knob (see the "Adjust range" line it
+    # logs at warmup). MuseTalk has no way to pick this automatically — it's
+    # a human-in-the-loop value set by comparing generated video quality.
+    bbox_shift: Optional[int] = Field(default=None, ge=-30, le=30)
 
     model_config = {"extra": "forbid"}
 

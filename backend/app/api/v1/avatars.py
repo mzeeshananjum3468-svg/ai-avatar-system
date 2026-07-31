@@ -1,3 +1,4 @@
+import json
 import logging
 import tempfile
 import uuid
@@ -87,13 +88,18 @@ async def _generate_idle_thinking_videos(avatar_id: str, image_key: str) -> None
 
     temp_image = TMPDIR / f"{avatar_id}_liveportrait_source.jpg"
     idle_path: Optional[str] = None
+    idle_reversed_path: Optional[str] = None
     thinking_path: Optional[str] = None
+    thinking_reversed_path: Optional[str] = None
     try:
         temp_image.write_bytes(await storage_service.download_file(image_key))
 
-        idle_path, thinking_path = await liveportrait_service.generate_idle_and_thinking(
-            str(temp_image), avatar_id
-        )
+        (
+            idle_path,
+            idle_reversed_path,
+            thinking_path,
+            thinking_reversed_path,
+        ) = await liveportrait_service.generate_idle_and_thinking(str(temp_image), avatar_id)
         if not idle_path or not thinking_path:
             await _set_avatar_fields(avatar_id, status="failed")
             return
@@ -106,11 +112,29 @@ async def _generate_idle_thinking_videos(avatar_id: str, image_key: str) -> None
             f"avatars/{avatar_id}/thinking.mp4",
             content_type="video/mp4",
         )
+        # Best-effort — a missing reversed clip just means the client falls
+        # back to a plain forward loop for that clip, not a failed avatar.
+        idle_reversed_url = None
+        if idle_reversed_path:
+            idle_reversed_url = await storage_service.upload_file(
+                Path(idle_reversed_path).read_bytes(),
+                f"avatars/{avatar_id}/idle_reversed.mp4",
+                content_type="video/mp4",
+            )
+        thinking_reversed_url = None
+        if thinking_reversed_path:
+            thinking_reversed_url = await storage_service.upload_file(
+                Path(thinking_reversed_path).read_bytes(),
+                f"avatars/{avatar_id}/thinking_reversed.mp4",
+                content_type="video/mp4",
+            )
 
         await _set_avatar_fields(
             avatar_id,
             idle_video_url=idle_url,
             thinking_video_url=thinking_url,
+            idle_video_reversed_url=idle_reversed_url,
+            thinking_video_reversed_url=thinking_reversed_url,
             status="ready",
         )
 
@@ -122,8 +146,12 @@ async def _generate_idle_thinking_videos(avatar_id: str, image_key: str) -> None
         temp_image.unlink(missing_ok=True)
         if idle_path:
             Path(idle_path).unlink(missing_ok=True)
+        if idle_reversed_path:
+            Path(idle_reversed_path).unlink(missing_ok=True)
         if thinking_path:
             Path(thinking_path).unlink(missing_ok=True)
+        if thinking_reversed_path:
+            Path(thinking_reversed_path).unlink(missing_ok=True)
 
 
 @router.post("/upload", response_model=AvatarResponse, status_code=status.HTTP_201_CREATED)
@@ -411,10 +439,27 @@ async def delete_avatar(
     try:
         await storage_service.delete_file(avatar.s3_key)
         await storage_service.delete_file(avatar.s3_key.replace("image.jpg", "thumbnail.jpg"))
+        # MuseTalk's per-avatar face/latent cache — see animator.py
+        # _animate_musetalk, which names it "<source-file>.musetalk_cache.pkl".
+        await storage_service.delete_file(f"{avatar.s3_key}.musetalk_cache.pkl")
         if avatar.idle_video_url:
             await storage_service.delete_file(f"avatars/{avatar_id}/idle.mp4")
+            await storage_service.delete_file(f"avatars/{avatar_id}/idle.mp4.musetalk_cache.pkl")
+        if avatar.idle_video_reversed_url:
+            await storage_service.delete_file(f"avatars/{avatar_id}/idle_reversed.mp4")
         if avatar.thinking_video_url:
             await storage_service.delete_file(f"avatars/{avatar_id}/thinking.mp4")
+        if avatar.thinking_video_reversed_url:
+            await storage_service.delete_file(f"avatars/{avatar_id}/thinking_reversed.mp4")
+        metadata = avatar.avatar_metadata or {}
+        if isinstance(metadata, str):
+            try:
+                metadata = json.loads(metadata)
+            except Exception:
+                metadata = {}
+        source_key = metadata.get("source_key")
+        if source_key:
+            await storage_service.delete_file(f"{source_key}.musetalk_cache.pkl")
     except Exception as e:
         # Row is gone; leftover files are harmless and reaped by the cleanup task.
         logger.warning(f"Could not delete stored files for avatar {avatar_id}: {e}")
