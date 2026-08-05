@@ -44,6 +44,7 @@ interface VideoChunk {
 interface DownloadItem {
   index: number
   url: string
+  text: string
   gen: number
 }
 
@@ -301,14 +302,22 @@ export function ChatInterface({ avatarId, voiceId, resumeSessionId, onSessionCre
   const isMutedRef = useRef(false)
 
   // ── Text/animation sync ──────────────────────────────────────────────────
-  // LLM tokens normally arrive well before TTS+MuseTalk produce the first
-  // playable chunk. To make the text bubble appear in sync with the avatar
-  // actually talking (instead of racing ahead of it), tokens are buffered
-  // silently here and only flushed into the visible `streamingContent` once
-  // the first chunk of THIS turn starts really playing (see openGate()).
-  const pendingTextRef = useRef('')                 // all tokens accumulated so far this turn
+  // LLM tokens (and the full assembled reply) normally arrive well before
+  // TTS+MuseTalk produce and play every chunk. To make the text bubble track
+  // what the avatar is actually speaking (instead of racing ahead of it),
+  // raw tokens are never shown directly — the visible `streamingContent` is
+  // built up one reply chunk at a time, exactly when each chunk's video
+  // actually starts playing (see revealChunkText()).
+  const pendingTextRef = useRef('')                 // all tokens accumulated so far this turn — safety-net fallback only
   const finalMessageRef = useRef<string | null>(null) // full text once the LLM is done, held if animation hasn't started
   const firstChunkPlayedRef = useRef(false)         // true once this turn's first chunk has actually started playing
+  // Text actually revealed so far this turn, one reply chunk at a time — the
+  // displayed bubble tracks exactly which sentence the avatar is currently
+  // speaking instead of jumping to the full LLM response (which finishes
+  // generating, and sends its complete-text 'message' event, well before
+  // TTS+MuseTalk have produced/played every chunk — see revealChunkText()).
+  const spokenTextRef = useRef('')
+  const lastRevealedChunkIndexRef = useRef(-1)      // dedupes repeat reveals of the same chunk
 
   const mediaRecorderRef = useRef<MediaRecorder | null>(null)
   const messagesEndRef = useRef<HTMLDivElement>(null)
@@ -479,9 +488,9 @@ export function ChatInterface({ avatarId, voiceId, resumeSessionId, onSessionCre
   // loop has its own dedicated element (videoIdleRef, see playLoop()) and
   // never goes through here, so this never has to coordinate with it.
   function transitionTo(src: string, mode: string, opts: {
-    muted?: boolean; objectUrl?: string | null; onCommit?: () => void
+    muted?: boolean; objectUrl?: string | null; onCommit?: () => void; chunk?: VideoChunk
   } = {}) {
-    const { muted = true, objectUrl = null, onCommit } = opts
+    const { muted = true, objectUrl = null, onCommit, chunk } = opts
     const active = activeVideoEl()
     const standby = standbyVideoEl()
     if (!active || !standby) return
@@ -506,12 +515,13 @@ export function ChatInterface({ avatarId, voiceId, resumeSessionId, onSessionCre
       // LAST, after every DOM/ref mutation above (including onCommit's
       // prebufferNext) — this whole swap has to fully land first so a
       // re-render triggered here can never land mid-swap.
-      openGate() // this chunk is actually playing now — reveal text if this is the turn's first
+      if (chunk) revealChunkText(chunk.index, chunk.text) // this chunk is actually playing now — reveal its text
     }
 
     if (active.dataset.mode === mode && active.src === src) {
       pendingChunkTransitionRef.current = false
       switchTo(active) // already showing this exact chunk — make sure it's marked speaking
+      if (chunk) revealChunkText(chunk.index, chunk.text)
       return
     }
 
@@ -688,14 +698,14 @@ export function ChatInterface({ avatarId, voiceId, resumeSessionId, onSessionCre
       prebufferNext()
       // Fires React state updates — must run LAST, after prebufferNext(),
       // same reasoning as the call at the end of transitionTo's commit().
-      openGate() // this chunk is actually playing now — reveal text if this is the turn's first
+      revealChunkText(item.index, item.text) // this chunk is actually playing now — reveal its text
     })
   }
 
   function playChunk(item: VideoChunk) {
     isPlayingChunkRef.current = true
     transitionTo(item.url, 'chunk:' + item.index, {
-      muted: isMutedRef.current, objectUrl: item.url,
+      muted: isMutedRef.current, objectUrl: item.url, chunk: item,
       onCommit: () => prebufferNext(),
     })
   }
@@ -721,7 +731,7 @@ export function ChatInterface({ avatarId, voiceId, resumeSessionId, onSessionCre
       .then((blob) => {
         if (item.gen !== currentGenRef.current) return // stale — superseded by barge-in
         const objectUrl = URL.createObjectURL(blob)
-        playQueueRef.current.push({ url: objectUrl, text: '', index: item.index })
+        playQueueRef.current.push({ url: objectUrl, text: item.text, index: item.index })
         if (!isPlayingChunkRef.current) {
           if (sendTimeRef.current) setLatencyMs(Date.now() - sendTimeRef.current)
           tryPlayNext()
@@ -756,14 +766,32 @@ export function ChatInterface({ avatarId, voiceId, resumeSessionId, onSessionCre
     finalMessageRef.current = null
   }
 
-  // Flips the text bubble on. Called the moment this turn's first video
-  // chunk actually starts playing (see the `openGate()` call sites in
-  // commitPrebuffered/transitionTo's commit()) — idempotent, so later
-  // chunks calling it again are no-ops. If the LLM already finished before
-  // any chunk played (the common case — TTS+animation lag behind token
-  // generation), the full final message was sitting in finalMessageRef;
-  // otherwise reveal whatever's buffered so far and let 'token' take it
-  // from there in real time.
+  // Advances the displayed text one reply chunk at a time, called the moment
+  // that chunk's video actually starts playing (see the call sites in
+  // commitPrebuffered/transitionTo's commit()) — so the bubble always shows
+  // exactly what the avatar is currently speaking, never further ahead.
+  // Deliberately NOT fed by raw 'token' events or the 'message' event's full
+  // text: those both arrive well before TTS+MuseTalk finish producing (let
+  // alone playing) every chunk, and showing them immediately would race
+  // ahead of the avatar. Idempotent per chunk index so a duplicate call
+  // (e.g. transitionTo's "already showing this exact chunk" branch) can't
+  // double-append the same sentence.
+  function revealChunkText(index: number, text: string) {
+    if (index <= lastRevealedChunkIndexRef.current) return
+    lastRevealedChunkIndexRef.current = index
+    const piece = text.trim()
+    if (piece) {
+      spokenTextRef.current = spokenTextRef.current ? `${spokenTextRef.current} ${piece}` : piece
+    }
+    firstChunkPlayedRef.current = true
+    setIsTyping(false)
+    setStreamingContent(spokenTextRef.current)
+  }
+
+  // Safety-net-only fallback: reveals whatever text is available without
+  // waiting for a chunk to actually play. Used solely when NO chunk ever
+  // played for this turn (every chunk failed to animate, or the turn ended
+  // before any chunk arrived) — the normal path is revealChunkText() above.
   function openGate() {
     if (firstChunkPlayedRef.current) return
     firstChunkPlayedRef.current = true
@@ -777,13 +805,19 @@ export function ChatInterface({ avatarId, voiceId, resumeSessionId, onSessionCre
 
   // Only actually leave "responding" once the server says the turn is over
   // AND the local pipeline has caught up — otherwise a chunk still in flight
-  // would get skipped over and drop straight to idle before it plays.
+  // would get skipped over and drop straight to idle before it plays. This
+  // is also the ONLY place the full-text 'message' payload is committed as
+  // the permanent transcript bubble — committing it as soon as it arrives
+  // (it's sent the instant the LLM finishes, well before TTS+MuseTalk finish
+  // producing/playing every chunk) would flash the complete reply on screen
+  // long before the avatar has finished speaking it.
   function maybeFinishResponding() {
     if (streamEndedRef.current && pipelineDrained() && isRespondingRef.current) {
       // Safety net: every chunk failed to animate (see the "Avatar animation
       // failed for all sentences" error path), so the gate would otherwise
       // never open and the whole reply would stay buffered forever.
       if (!firstChunkPlayedRef.current) openGate()
+      if (finalMessageRef.current !== null) commitFinalMessage(finalMessageRef.current)
       isRespondingRef.current = false
       setIsProcessing(false)
     }
@@ -847,6 +881,8 @@ export function ChatInterface({ avatarId, voiceId, resumeSessionId, onSessionCre
     pendingTextRef.current = ''
     finalMessageRef.current = null
     firstChunkPlayedRef.current = false
+    spokenTextRef.current = ''
+    lastRevealedChunkIndexRef.current = -1
     ;[videoARef.current, videoBRef.current].forEach((v) => {
       if (!v) return
       v.pause()
@@ -1104,15 +1140,12 @@ export function ChatInterface({ avatarId, voiceId, resumeSessionId, onSessionCre
 
   const handleWebSocketMessage = useCallback((data: WsMessage) => {
     switch (data.type) {
-      // Live token stream. Buffered silently until this turn's first video
-      // chunk actually starts playing (openGate()) — otherwise the text
-      // races ahead of TTS+animation, which lag well behind token generation.
+      // Live token stream. Only buffered here (as a safety-net fallback for
+      // openGate()) — never shown directly. The visible bubble is driven
+      // entirely by revealChunkText(), one reply chunk at a time, so it never
+      // races ahead of what the avatar has actually started speaking.
       case 'token':
         pendingTextRef.current += data.token
-        if (firstChunkPlayedRef.current) {
-          setStreamingContent(prev => prev + data.token)
-          setIsTyping(false)
-        }
         break
 
       case 'transcription': {
@@ -1130,21 +1163,20 @@ export function ChatInterface({ avatarId, voiceId, resumeSessionId, onSessionCre
         pendingTextRef.current = ''
         finalMessageRef.current = null
         firstChunkPlayedRef.current = false
+        spokenTextRef.current = ''
+        lastRevealedChunkIndexRef.current = -1
         break
       }
 
-      case 'message': {
-        if (firstChunkPlayedRef.current) {
-          // Gate's already open (a chunk is already playing) — show it now.
-          commitFinalMessage(data.content)
-        } else {
-          // Common case: the LLM finished well before TTS+animation produced
-          // a playable chunk. Hold the final text — openGate() fires it the
-          // moment the avatar actually starts talking instead of now.
-          finalMessageRef.current = data.content
-        }
+      // Full assembled reply text — arrives the instant the LLM finishes
+      // streaming, well before TTS+MuseTalk finish producing (let alone
+      // playing) every chunk. Held here and only committed as the permanent
+      // transcript bubble once the whole turn's pipeline is actually drained
+      // (see maybeFinishResponding) — never shown early.
+      case 'message':
+        finalMessageRef.current = data.content
+        maybeFinishResponding()
         break
-      }
 
       case 'video_chunk_start':
         playQueueRef.current = []
@@ -1153,7 +1185,7 @@ export function ChatInterface({ avatarId, voiceId, resumeSessionId, onSessionCre
         break
 
       case 'video_chunk': {
-        downloadQueueRef.current.push({ index: data.chunk_index, url: data.video_url, gen: currentGenRef.current })
+        downloadQueueRef.current.push({ index: data.chunk_index, url: data.video_url, text: data.text, gen: currentGenRef.current })
         setCurrentChunkProgress(prev => ({ current: data.chunk_index + 1, total: prev.total }))
         pumpDownloads()
         break
@@ -1189,6 +1221,8 @@ export function ChatInterface({ avatarId, voiceId, resumeSessionId, onSessionCre
         pendingTextRef.current = ''
         finalMessageRef.current = null
         firstChunkPlayedRef.current = false
+        spokenTextRef.current = ''
+        lastRevealedChunkIndexRef.current = -1
         if (!isPlayingChunkRef.current) playLoop()
         break
 
@@ -1255,6 +1289,8 @@ export function ChatInterface({ avatarId, voiceId, resumeSessionId, onSessionCre
     pendingTextRef.current = ''
     finalMessageRef.current = null
     firstChunkPlayedRef.current = false
+    spokenTextRef.current = ''
+    lastRevealedChunkIndexRef.current = -1
     playLoop()
   }
 

@@ -62,24 +62,43 @@ def _write_private_bytes(path: Path, data: bytes) -> None:
         pass
 
 
-# ── chunking thresholds (first-frame latency vs prosody trade-off) ──────────
+# ── chunking thresholds (first-frame latency vs throughput trade-off) ───────
 # The opening fragment ships at the first CLAUSE boundary (comma/semicolon/
-# colon/dash) once it's long enough, so audio+video start as early as
-# possible. Every chunk after that uses SENTENCE boundaries — fewer TTS
-# calls and smoother prosody for the bulk of the reply.
+# colon/dash) once it's long enough. Every chunk after that uses SENTENCE
+# boundaries — fewer TTS calls and smoother prosody for the bulk of the
+# reply.
 _MIN_SENTENCE_LEN = 35
 # Chatterbox's alignment-based EOS forcing (AlignmentStreamAnalyzer) only
 # trusts its own "keep going" heuristic once the text is > 5 tokens long;
 # below that it's prone to losing track of position and over-generating
 # past the real end of speech (spoken text followed by trailing gibberish).
 # 10 chars (~2 words) sat right in that unreliable range, so first-chunk
-# audio was the most common place this showed up. 35 chars still ships
-# well before a full sentence (latency win intact) but reliably clears
-# the token-count floor.
-_MIN_FIRST_CHUNK_LEN = 40  # ship the opening clause fast, but not too short for TTS
+# audio was the most common place this showed up — the token-count floor
+# alone would only need ~35 chars.
+#
+# FIRST_CHUNK_MIN_LEN (config.py) is deliberately well above that floor,
+# though: TTS+MuseTalk run strictly sequentially per chunk
+# (_animate_from_queue below), so a stream of tiny chunks whose compute time
+# exceeds their own playback duration falls behind real time and the
+# frontend stalls mid-reply (see combined_rtf in
+# scripts/benchmark_pipeline_rtf.py — each chunk pays a fixed per-call
+# overhead on top of audio-proportional compute, so small chunks have a
+# worse effective RTF than large ones). A bigger opening chunk costs more
+# time-to-first-frame but amortizes that fixed overhead over more audio,
+# buying a lead the rest of the reply's normal sentence-sized chunks spend
+# down without the queue running dry.
+_MIN_FIRST_CHUNK_LEN = settings.FIRST_CHUNK_MIN_LEN
 # Force-flush a run-on with no usable punctuation so we never stall waiting
 # for a boundary that may never come.
 _MAX_CHUNK_CHARS = 200
+# The first chunk's own min_len (FIRST_CHUNK_MIN_LEN, config.py) sits close
+# to _MAX_CHUNK_CHARS, so sharing that same backstop leaves almost no room
+# for a clause boundary to land before the word-boundary force-flush wins —
+# in practice that meant most first sentences got hard-cut mid-word instead
+# of at their own punctuation. Give the first chunk a wider backstop so the
+# punctuation path gets a real chance; the flush is still there as a true
+# last resort for a genuine run-on with no punctuation at all.
+_MAX_FIRST_CHUNK_CHARS = _MIN_FIRST_CHUNK_LEN + 200
 
 # Boundary regexes. Lookbehind keeps the punctuation attached to the chunk
 # (better TTS prosody than trailing a bare clause).
@@ -712,7 +731,8 @@ class ConnectionManager:
 
                     sep = _SENTENCE_RE if first_chunk_sent else _CLAUSE_RE
                     min_len = _MIN_SENTENCE_LEN if first_chunk_sent else _MIN_FIRST_CHUNK_LEN
-                    chunks, buf = _drain_chunks(buf, sep, min_len, _MAX_CHUNK_CHARS)
+                    max_len = _MAX_CHUNK_CHARS if first_chunk_sent else _MAX_FIRST_CHUNK_CHARS
+                    chunks, buf = _drain_chunks(buf, sep, min_len, max_len)
                     for chunk in chunks:
                         await queue.put(chunk)
                         first_chunk_sent = True

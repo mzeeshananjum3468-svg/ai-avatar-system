@@ -140,6 +140,20 @@ class Settings(BaseSettings):
     #MuseTalk Settings
     MUSETALK_TAIL_HOLD_FRAMES: int = 4
 
+    # Chunking (backend/app/websocket.py's _drain_chunks). TTS+MuseTalk run
+    # strictly sequentially per chunk, so if a chunk's compute time exceeds
+    # its own playback duration (combined_rtf > 1 in
+    # scripts/benchmark_pipeline_rtf.py), a stream of small chunks falls
+    # behind real time and the frontend stalls mid-reply. The opening chunk
+    # is deliberately sized well past a single clause/sentence — it costs
+    # more time-to-first-frame, but amortizes each chunk's fixed
+    # (non-audio-proportional) overhead over more audio, buying a lead that
+    # the rest of the reply's normal, shorter sentence chunks spend down
+    # without the queue running dry. Re-tune by sweeping --sentence-counts in
+    # that benchmark script and picking the smallest count whose
+    # combined_throughput_factor is comfortably >= 1.
+    FIRST_CHUNK_MIN_LEN: int = 150
+
     # Monitoring
     SENTRY_DSN: Optional[str] = None
     PROMETHEUS_ENABLED: bool = True
