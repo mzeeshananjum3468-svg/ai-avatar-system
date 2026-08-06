@@ -157,7 +157,10 @@ app.add_middleware(RateLimitMiddleware)
 app.add_middleware(
     CORSMiddleware,
     # allow_origins=settings.CORS_ORIGINS,
-    allow_origins =["*"],
+    allow_origins=[
+        "http://localhost:3001",
+        "http://10.28.80.162:3001",
+    ],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],

@@ -1,6 +1,21 @@
 import axios, { AxiosError, InternalAxiosRequestConfig } from 'axios'
 
-const API_URL = process.env.NEXT_PUBLIC_API_URL || 'http://localhost:8000'
+// If NEXT_PUBLIC_API_URL is explicitly set (docker-compose/prod), always use
+// it. Otherwise, derive the backend host from whatever host the page was
+// loaded from (localhost vs a LAN IP) so the API call stays same-origin-ish
+// with the page — required for the SameSite=Lax auth cookie to be sent.
+// Without this, an env var hardcoded to one host breaks auth when the app is
+// opened via the other.
+function resolveApiUrl(): string {
+  if (process.env.NEXT_PUBLIC_API_URL) return process.env.NEXT_PUBLIC_API_URL
+  if (typeof window !== 'undefined') {
+    const port = process.env.NEXT_PUBLIC_API_PORT || '8901'
+    return `${window.location.protocol}//${window.location.hostname}:${port}`
+  }
+  return 'http://localhost:8000'
+}
+
+const API_URL = resolveApiUrl()
 
 const STORAGE_KEY = 'avatar-system-storage'
 
@@ -281,7 +296,16 @@ export const api = {
  * (the WebSocket constructor does not let us attach an Authorization header).
  */
 export function buildSessionWsUrl(sessionId: string): string {
-  const rawUrl = process.env.NEXT_PUBLIC_WS_URL || process.env.NEXT_PUBLIC_API_URL || 'http://localhost:8000'
+  let rawUrl: string
+  if (process.env.NEXT_PUBLIC_WS_URL || process.env.NEXT_PUBLIC_API_URL) {
+    rawUrl = process.env.NEXT_PUBLIC_WS_URL || process.env.NEXT_PUBLIC_API_URL || 'http://localhost:8000'
+  } else if (typeof window !== 'undefined') {
+    const port = process.env.NEXT_PUBLIC_API_PORT || '8901'
+    const wsProtocol = window.location.protocol === 'https:' ? 'wss' : 'ws'
+    rawUrl = `${wsProtocol}://${window.location.hostname}:${port}`
+  } else {
+    rawUrl = 'http://localhost:8000'
+  }
   const wsBase = rawUrl.replace(/^http/, 'ws')
   const token = readToken()
   const path = `${wsBase}/ws/session/${encodeURIComponent(sessionId)}`
