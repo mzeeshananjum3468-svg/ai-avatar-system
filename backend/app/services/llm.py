@@ -37,13 +37,19 @@ logger = logging.getLogger(__name__)
 # )
 
 DEFAULT_SYSTEM_PROMPT = """
-You are a friendly, natural AI avatar having a real-time spoken conversation with the user, not a text chatbot, so everything you say is heard aloud rather than read. Talk the way a helpful, warm person would: simple words, short sentences, usually just one to three of them unless the user clearly wants more. Answer directly instead of restating the question, opening with a long introduction, or padding your reply with filler and unnecessary apologies. If you are not sure about something, say so plainly instead of guessing.
+You are a warm, friendly AI avatar having a natural real-time conversation.
 
-Keep the whole reply short too, not just each sentence — a sentence or two for most questions, a short paragraph at most for something genuinely complex, never more. Every extra sentence is more speech your avatar has to generate and lip-sync before it can finish talking, so a long answer makes you visibly fall behind and lag. If a topic really needs more than that, give the most useful couple of sentences first and let the user ask a follow-up rather than saying everything at once.
+PERSONALITY:
+Be natural, casual, and friendly. Talk like a normal helpful person, not a scripted or formal assistant. Match the user's tone and language, including English, Urdu, and Hindi.
 
-Match whatever language the user speaks to you, whether that is English, Hindi, Urdu, or something else, and do not translate unless they ask you to. Greet the user back briefly if they greet you, and when they ask a follow-up, keep the conversation moving naturally without repeating what was already said.
+CONVERSATION:
+Respond naturally to what the user says. Answer directly without repeating their question. Keep responses reasonably concise, but do not make them unnecessarily short or overly detailed. Give enough context to make the response feel complete and natural.
 
-Never use bullet points, numbered lists, headers, markdown, emojis, or written-out abbreviations like "e.g.", "i.e.", or "etc." — say things out in full sentences the way you would speak them, since a list or a symbol means nothing when read aloud. If someone asks for code, do not read syntax out loud; describe what the code does and how to use it in plain spoken terms instead.
+STYLE:
+For casual conversation, be relaxed and conversational. For questions, be clear and helpful. For instructions, explain what is needed without unnecessary detail. If you are unsure, say so instead of guessing.
+
+VOICE:
+Everything you say will be spoken aloud. Do not use markdown, bullets, numbered lists, emojis, or abbreviations.
 """
 
 
@@ -69,13 +75,21 @@ class LLMUnavailable(LLMError):
     """Network failure, timeout, or 5xx from the provider."""
 
 
+def _merge_system_prompts(system_prompt: Optional[str]) -> str:
+    """Merge the default system prompt with an optional avatar-specific prompt."""
+    avatar_prompt = (system_prompt or "").strip()
+    if not avatar_prompt:
+        return DEFAULT_SYSTEM_PROMPT.strip()
+    return f"{DEFAULT_SYSTEM_PROMPT.strip()}\n\n{avatar_prompt}"
+
+
 def _cacheable_system(system_prompt: Optional[str]) -> list[dict]:
     """
     Build a system block list with prompt-cache marking applied to the
     (long-lived) system prompt. The SDK accepts either a plain string OR
     a list of blocks; blocks are needed to attach `cache_control` per-block.
     """
-    text = system_prompt or DEFAULT_SYSTEM_PROMPT
+    text = _merge_system_prompts(system_prompt)
     return [{"type": "text", "text": text, "cache_control": {"type": "ephemeral"}}]
 
 
@@ -196,8 +210,8 @@ class LLMService:
         messages: List[Dict[str, str]],
         system_prompt: Optional[str] = None,
     ) -> str:
-        if system_prompt:
-            messages = [{"role": "system", "content": system_prompt}] + messages
+        merged_system_prompt = _merge_system_prompts(system_prompt)
+        messages = [{"role": "system", "content": merged_system_prompt}] + messages
 
         try:
             response = await self.client.chat.completions.create(
@@ -255,9 +269,8 @@ class LLMService:
         system_prompt: Optional[str] = None,
     ) -> AsyncGenerator[str, None]:
 
-        system_prompt = system_prompt or DEFAULT_SYSTEM_PROMPT
-        if system_prompt:
-            messages = [{"role": "system", "content": system_prompt}] + messages
+        merged_system_prompt = _merge_system_prompts(system_prompt)
+        messages = [{"role": "system", "content": merged_system_prompt}] + messages
 
         try:
             stream = await self.client.chat.completions.create(
